@@ -94,6 +94,7 @@ export async function pushSharedState(
     updatedBy: statePayload.updatedBy || 'MenuPlan',
     recipes: statePayload.recipes,
     weeklyMenu: statePayload.weeklyMenu,
+    previousMenuSnapshot: statePayload.previousMenuSnapshot || null,
     shoppingState: statePayload.shoppingState,
   };
 

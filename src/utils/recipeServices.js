@@ -501,31 +501,151 @@ function decodePdfHexString(hex) {
   return bytes.map((b) => String.fromCharCode(b)).join('');
 }
 
-function extractTextOperatorsFromStream(content) {
+function decodeUtf16BeHex(hex) {
+  const clean = hex.replace(/[^0-9a-fA-F]/g, '');
+  if (!clean) return '';
+  const padded = clean.length % 4 === 0 ? clean : clean.padStart(Math.ceil(clean.length / 4) * 4, '0');
+  let out = '';
+  for (let i = 0; i + 3 < padded.length; i += 4) {
+    const code = parseInt(padded.slice(i, i + 4), 16);
+    if (code > 0) out += String.fromCharCode(code);
+  }
+  return out;
+}
+
+function parseToUnicodeCMap(cmapText, cidMap) {
+  const bfcharBlocks = cmapText.match(/beginbfchar[\s\S]*?endbfchar/g) || [];
+  for (const block of bfcharBlocks) {
+    const pairRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
+    let m;
+    while ((m = pairRegex.exec(block)) !== null) {
+      const key = m[1].toUpperCase();
+      const val = decodeUtf16BeHex(m[2]);
+      if (val) cidMap.set(key, val);
+    }
+  }
+
+  const bfrangeBlocks = cmapText.match(/beginbfrange[\s\S]*?endbfrange/g) || [];
+  for (const block of bfrangeBlocks) {
+    const arrayRangeRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*\[([\s\S]*?)\]/g;
+    let am;
+    while ((am = arrayRangeRegex.exec(block)) !== null) {
+      const start = parseInt(am[1], 16);
+      const end = parseInt(am[2], 16);
+      const hexLen = am[1].length;
+      const items = am[3].match(/<([0-9a-fA-F]+)>/g) || [];
+      const limit = Math.min(end - start + 1, items.length, 2048);
+      for (let i = 0; i < limit; i += 1) {
+        const key = (start + i).toString(16).toUpperCase().padStart(hexLen, '0');
+        const val = decodeUtf16BeHex(items[i].slice(1, -1));
+        if (val) cidMap.set(key, val);
+      }
+    }
+
+    const seqRangeRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
+    let sm;
+    while ((sm = seqRangeRegex.exec(block)) !== null) {
+      const start = parseInt(sm[1], 16);
+      const end = parseInt(sm[2], 16);
+      const hexLen = sm[1].length;
+      const dstStart = parseInt(sm[3], 16);
+      const limit = Math.min(end - start + 1, 2048);
+      for (let i = 0; i < limit; i += 1) {
+        const key = (start + i).toString(16).toUpperCase().padStart(hexLen, '0');
+        const cp = dstStart + i;
+        if (cp > 0) cidMap.set(key, String.fromCodePoint(cp));
+      }
+    }
+  }
+}
+
+function decodePdfHexWithCMap(hex, cidMap) {
+  const clean = hex.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  if (!clean) return '';
+
+  if (cidMap && cidMap.size > 0) {
+    let out4 = '';
+    let hits4 = 0;
+    const chunks4 = Math.floor(clean.length / 4);
+    if (chunks4 > 0 && clean.length % 4 === 0) {
+      for (let i = 0; i < clean.length; i += 4) {
+        const token = clean.slice(i, i + 4);
+        if (cidMap.has(token)) {
+          out4 += cidMap.get(token);
+          hits4 += 1;
+        }
+      }
+      if (hits4 > 0) return out4;
+    }
+
+    let out2 = '';
+    let hits2 = 0;
+    if (clean.length % 2 === 0) {
+      for (let i = 0; i < clean.length; i += 2) {
+        const token = clean.slice(i, i + 2);
+        if (cidMap.has(token)) {
+          out2 += cidMap.get(token);
+          hits2 += 1;
+        } else {
+          out2 += String.fromCharCode(parseInt(token, 16));
+        }
+      }
+      if (hits2 > 0) return out2;
+    }
+  }
+
+  return decodePdfHexString(clean);
+}
+
+function decodeTjArray(arrayText, cidMap) {
+  let out = '';
+  const parts = arrayText.match(/\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|-?\d+(?:\.\d+)?/g) || [];
+  for (const part of parts) {
+    if (part.startsWith('(') && part.endsWith(')')) {
+      out += decodePdfLiteralString(part.slice(1, -1));
+    } else if (part.startsWith('<') && part.endsWith('>')) {
+      out += decodePdfHexWithCMap(part.slice(1, -1), cidMap);
+    } else {
+      const kern = Number(part);
+      if (Number.isFinite(kern) && kern <= -120 && out && !out.endsWith(' ')) {
+        out += ' ';
+      }
+    }
+  }
+  return out;
+}
+
+function extractTextOperatorsFromStream(content, cidMap = null) {
   const lines = [];
   let currentLine = '';
 
   const btBlocks = content.match(/BT[\s\S]*?ET/g) || [content];
   for (const block of btBlocks) {
+    let currentY = null;
+    let currentX = 0;
     const tokens =
       block.match(
-        /\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+T[dD]|T\*|Tm|TJ|Tj|'|"/g,
+        /\[(?:[^\[\]]|\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>)*\]\s*TJ|\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|(?:-?\d+(?:\.\d+)?\s+){5}-?\d+(?:\.\d+)?\s+Tm|-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+T[dD]|T\*|Tj|'|"/g,
       ) || [];
 
     let pendingBuffer = '';
     for (const token of tokens) {
-      if (token.startsWith('(') && token.endsWith(')')) {
+      if (token.endsWith('TJ') && token.startsWith('[')) {
+        const inner = token.slice(1, token.lastIndexOf(']'));
+        currentLine += pendingBuffer + decodeTjArray(inner, cidMap);
+        pendingBuffer = '';
+      } else if (token.startsWith('(') && token.endsWith(')')) {
         pendingBuffer += decodePdfLiteralString(token.slice(1, -1));
       } else if (token.startsWith('<') && token.endsWith('>')) {
-        pendingBuffer += decodePdfHexString(token.slice(1, -1));
-      } else if (token === 'Tj' || token === 'TJ') {
+        pendingBuffer += decodePdfHexWithCMap(token.slice(1, -1), cidMap);
+      } else if (token === 'Tj') {
         currentLine += pendingBuffer;
         pendingBuffer = '';
       } else if (token === "'" || token === '"') {
         if (currentLine.trim()) lines.push(currentLine.trim());
         currentLine = pendingBuffer;
         pendingBuffer = '';
-      } else if (token === 'T*' || token === 'Tm') {
+      } else if (token === 'T*') {
         if (pendingBuffer) {
           currentLine += pendingBuffer;
           pendingBuffer = '';
@@ -534,19 +654,40 @@ function extractTextOperatorsFromStream(content) {
           lines.push(currentLine.trim());
           currentLine = '';
         }
+      } else if (/\s+Tm$/.test(token)) {
+        const nums = token.trim().split(/\s+/);
+        const nextX = Number(nums[4]) || 0;
+        const nextY = Number(nums[5]) || 0;
+        if (pendingBuffer) {
+          currentLine += pendingBuffer;
+          pendingBuffer = '';
+        }
+        if (currentY !== null && Math.abs(nextY - currentY) > 2) {
+          if (currentLine.trim()) {
+            lines.push(currentLine.trim());
+            currentLine = '';
+          }
+        } else if (currentLine && !currentLine.endsWith(' ') && nextX > currentX + 2) {
+          currentLine += ' ';
+        }
+        currentX = nextX;
+        currentY = nextY;
       } else if (/\s+T[dD]$/.test(token)) {
         const parts = token.trim().split(/\s+/);
+        const dx = Number(parts[0]) || 0;
         const dy = Number(parts[1]) || 0;
         if (pendingBuffer) {
           currentLine += pendingBuffer;
           pendingBuffer = '';
         }
         if (Math.abs(dy) < 1) {
-          if (currentLine && !currentLine.endsWith(' ')) currentLine += ' ';
+          if (currentLine && !currentLine.endsWith(' ') && dx > 2) currentLine += ' ';
         } else if (currentLine.trim()) {
           lines.push(currentLine.trim());
           currentLine = '';
         }
+        currentX += dx;
+        if (currentY !== null) currentY += dy;
       }
     }
     if (pendingBuffer) currentLine += pendingBuffer;
@@ -878,42 +1019,6 @@ export function parseMultipleRecipesFromText(rawText = '', fileName = 'Receta PD
     .filter((entry) => entry.recipe && entry.recipe.name);
 }
 
-function reconstructLinesFromPdfJsItems(items = []) {
-  const rows = [];
-  for (const item of items) {
-    const str = item.str;
-    if (!str || !str.trim()) continue;
-    const x = item.transform?.[4] ?? 0;
-    const y = item.transform?.[5] ?? 0;
-
-    let row = rows.find((r) => Math.abs(r.y - y) <= 3);
-    if (!row) {
-      row = { y, segments: [] };
-      rows.push(row);
-    }
-    row.segments.push({ x, str, width: item.width || 0 });
-  }
-
-  rows.sort((a, b) => b.y - a.y);
-
-  return rows
-    .map((row) => {
-      row.segments.sort((a, b) => a.x - b.x);
-      let line = '';
-      let lastEndX = null;
-      for (const seg of row.segments) {
-        if (lastEndX !== null && seg.x - lastEndX > 2 && !line.endsWith(' ') && !seg.str.startsWith(' ')) {
-          line += ' ';
-        }
-        line += seg.str;
-        lastEndX = seg.x + seg.width;
-      }
-      return line.replace(/\s+/g, ' ').trim();
-    })
-    .filter(Boolean)
-    .join('\n');
-}
-
 export async function extractRawTextFromPdfFile(file) {
   if (!file) {
     throw new Error('No se ha seleccionado ningún archivo PDF.');
@@ -922,39 +1027,10 @@ export async function extractRawTextFromPdfFile(file) {
   const arrayBuffer = await file.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
 
-  // 1. Usar pdfjs-dist (reconstruyendo líneas reales por coordenada Y/X)
-  let pdfjsLib = typeof window !== 'undefined' ? window.pdfjsLib : null;
-  if (!pdfjsLib && typeof window === 'undefined') {
-    try {
-      const nodePdfJsPath = 'pdfjs-dist/legacy/build/pdf.mjs';
-      pdfjsLib = await import(/* @vite-ignore */ nodePdfJsPath);
-    } catch {
-      pdfjsLib = null;
-    }
-  }
-
-  if (pdfjsLib?.getDocument) {
-    try {
-      const pdfDoc = await pdfjsLib.getDocument({ data: bytes.slice(), verbosity: 0 }).promise;
-      const pageTexts = [];
-      for (let p = 1; p <= pdfDoc.numPages; p += 1) {
-        const page = await pdfDoc.getPage(p);
-        const textContent = await page.getTextContent();
-        const reconstructed = reconstructLinesFromPdfJsItems(textContent.items || []);
-        if (reconstructed) pageTexts.push(reconstructed);
-      }
-      const combinedPdfJs = pageTexts.join('\n').trim();
-      if (combinedPdfJs) {
-        return combinedPdfJs;
-      }
-    } catch {
-      // Continuar con extractor nativo de respaldo
-    }
-  }
-
-  // 2. Extractor PDF nativo (soporta streams sin comprimir y FlateDecode)
+  // Extractor PDF 100% compatible con navegadores móviles (ES2020, FlateDecode + ToUnicode CMap)
   const latin1 = bytesToLatin1(bytes);
-  const extractedChunks = [];
+  const decodedStreams = [];
+  const cidMap = new Map();
   const streamRegex = /<<([\s\S]*?)>>\s*stream\r?\n([\s\S]*?)endstream/g;
   let match;
 
@@ -981,17 +1057,25 @@ export async function extractRawTextFromPdfFile(file) {
       decodedText = bytesToLatin1(streamBytes);
     }
 
-    if (decodedText && (decodedText.includes('Tj') || decodedText.includes('TJ') || decodedText.includes('BT'))) {
-      const textFromOps = extractTextOperatorsFromStream(decodedText);
-      if (textFromOps.trim()) {
-        extractedChunks.push(textFromOps);
-      }
+    if (!decodedText) continue;
+
+    if (
+      decodedText.includes('begincmap') ||
+      decodedText.includes('beginbfchar') ||
+      decodedText.includes('beginbfrange')
+    ) {
+      parseToUnicodeCMap(decodedText, cidMap);
+    } else if (decodedText.includes('Tj') || decodedText.includes('TJ') || decodedText.includes('BT')) {
+      decodedStreams.push(decodedText);
     }
   }
 
+  const extractedChunks = decodedStreams
+    .map((streamText) => extractTextOperatorsFromStream(streamText, cidMap))
+    .filter((chunk) => chunk && chunk.trim());
+
   if (extractedChunks.length === 0) {
-    // Fallback para operadores de texto fuera de stream comprimido
-    const fallback = extractTextOperatorsFromStream(latin1);
+    const fallback = extractTextOperatorsFromStream(latin1, cidMap);
     if (fallback.trim()) {
       extractedChunks.push(fallback);
     }

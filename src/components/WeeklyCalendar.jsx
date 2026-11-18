@@ -12,8 +12,191 @@ import {
   Users,
   StickyNote,
   Scale,
+  Undo2,
+  AlertTriangle,
+  X,
+  BookOpen,
+  Clock,
+  ListOrdered,
 } from 'lucide-react';
-import { DAYS, MEAL_TYPES, DIET_GROUPS, inferDietGroup } from '../data/initialData';
+import {
+  DAYS,
+  MEAL_TYPES,
+  DIET_GROUPS,
+  inferDietGroup,
+  formatAmount,
+} from '../data/initialData';
+
+function resolveDishRecipeDetails(dish, recipes = []) {
+  const linked = recipes.find(
+    (r) =>
+      (dish.recipeId && r.id === dish.recipeId) ||
+      r.name.trim().toLowerCase() === (dish.name || '').trim().toLowerCase(),
+  );
+
+  return {
+    ...dish,
+    prepTime: dish.prepTime || linked?.prepTime || null,
+    description: dish.description || linked?.description || '',
+    steps: dish.steps?.length > 0 ? dish.steps : linked?.steps || [],
+    ingredients: dish.ingredients?.length > 0 ? dish.ingredients : linked?.ingredients || [],
+    dietGroup: dish.dietGroup || linked?.dietGroup || null,
+  };
+}
+
+function RecipeDetailModal({ viewingState, recipes, onClose, onEditDish }) {
+  if (!viewingState) return null;
+  const { dayId, mealId, dish } = viewingState;
+  const details = resolveDishRecipeDetails(dish, recipes);
+  const dayMeta = DAYS.find((d) => d.id === dayId);
+  const mealMeta = MEAL_TYPES.find((m) => m.id === mealId);
+  const dietGroupId = details.dietGroup || inferDietGroup({ ...details, mealCategory: mealId });
+  const dietMeta = DIET_GROUPS.find((g) => g.id === dietGroupId);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 p-0 backdrop-blur-sm sm:items-center sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="recipe-detail-title"
+    >
+      <div className="flex max-h-[90vh] w-full max-w-xl flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
+          <div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {dayMeta && (
+                <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-bold text-slate-700">
+                  {dayMeta.label}
+                </span>
+              )}
+              {mealMeta && (
+                <span className={`rounded-full border px-2.5 py-0.5 text-xs font-bold ${mealMeta.badgeClass}`}>
+                  {mealMeta.label}
+                </span>
+              )}
+              {dietMeta && mealId !== 'desayuno' && (
+                <span className={`rounded-full border px-2.5 py-0.5 text-xs font-bold ${dietMeta.badgeClass}`}>
+                  {dietMeta.label}
+                </span>
+              )}
+            </div>
+            <h2 id="recipe-detail-title" className="mt-2 text-lg font-extrabold text-slate-900 sm:text-xl">
+              {details.name}
+            </h2>
+            <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs font-semibold text-slate-500">
+              <span className="inline-flex items-center gap-1">
+                <Users className="h-3.5 w-3.5 text-emerald-600" />
+                {details.servings} personas
+              </span>
+              {details.prepTime && (
+                <span className="inline-flex items-center gap-1">
+                  <Clock className="h-3.5 w-3.5 text-emerald-600" />
+                  {details.prepTime} min
+                </span>
+              )}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Cerrar receta"
+            className="rounded-xl p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
+          {details.description && (
+            <p className="text-sm leading-relaxed text-slate-600">{details.description}</p>
+          )}
+
+          {details.notes && (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50/70 px-3.5 py-2.5 text-xs text-amber-900">
+              <StickyNote className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <span>{details.notes}</span>
+            </div>
+          )}
+
+          <div>
+            <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-500">
+              Ingredientes ({details.ingredients.length})
+            </h3>
+            {details.ingredients.length === 0 ? (
+              <p className="mt-2 text-xs text-slate-500">
+                Este plato no tiene ingredientes registrados.
+              </p>
+            ) : (
+              <ul className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                {details.ingredients.map((ing, idx) => (
+                  <li
+                    key={ing.id || idx}
+                    className="flex items-center justify-between gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs"
+                  >
+                    <span className="font-semibold text-slate-800">{ing.name}</span>
+                    {ing.amount > 0 && (
+                      <span className="shrink-0 rounded-md bg-emerald-50 px-2 py-0.5 font-bold text-emerald-700">
+                        {formatAmount(ing.amount)} {ing.unit}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div>
+            <h3 className="flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-wider text-slate-500">
+              <ListOrdered className="h-4 w-4 text-emerald-600" />
+              Preparación
+            </h3>
+            {details.steps.length === 0 ? (
+              <div className="mt-2 rounded-xl border border-dashed border-slate-200 bg-slate-50/70 px-4 py-4 text-xs text-slate-500">
+                Esta receta aún no tiene pasos de preparación guardados. Puedes añadirlos pulsando &ldquo;Editar plato&rdquo;.
+              </div>
+            ) : (
+              <ol className="mt-2.5 space-y-2.5">
+                {details.steps.map((step, idx) => (
+                  <li
+                    key={idx}
+                    className="flex items-start gap-3 rounded-xl border border-slate-100 bg-slate-50/80 p-3 text-sm leading-relaxed text-slate-800"
+                  >
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-xs font-bold text-white">
+                      {idx + 1}
+                    </span>
+                    <span>{step}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between gap-2 border-t border-slate-200 bg-slate-50 px-5 py-3.5">
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              onEditDish(dayId, mealId, dish);
+            }}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 transition hover:bg-slate-100 sm:text-sm"
+          >
+            <Pencil className="h-4 w-4" />
+            Editar plato
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-xl bg-emerald-600 px-5 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-emerald-700 sm:text-sm"
+          >
+            Cerrar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const MEAL_ICONS = {
   desayuno: Sunrise,
@@ -28,6 +211,7 @@ function MealSlotBlock({
   onAddDish,
   onEditDish,
   onDeleteDish,
+  onViewRecipe,
   compact = false,
 }) {
   const MealIcon = MEAL_ICONS[meal.id] || Sun;
@@ -80,8 +264,9 @@ function MealSlotBlock({
                 <div className="flex items-start justify-between gap-2">
                   <button
                     type="button"
-                    onClick={() => onEditDish(dayId, meal.id, dish)}
+                    onClick={() => onViewRecipe(dayId, meal.id, dish)}
                     className="flex-1 text-left focus:outline-none"
+                    title="Ver receta y preparación"
                   >
                     <p className="text-sm font-semibold leading-snug text-slate-900 group-hover:text-emerald-800">
                       {dish.name}
@@ -121,6 +306,14 @@ function MealSlotBlock({
                       {dietMeta.label}
                     </span>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => onViewRecipe(dayId, meal.id, dish)}
+                    className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700 ring-1 ring-emerald-200/80 transition hover:bg-emerald-100"
+                  >
+                    <BookOpen className="h-3 w-3" />
+                    Ver receta
+                  </button>
                 </div>
 
                 {dish.notes && (
@@ -140,18 +333,24 @@ function MealSlotBlock({
 
 export default function WeeklyCalendar({
   weeklyMenu,
+  recipes = [],
   plannedDishesCount,
   definitiveShoppingCount,
   dietBalance,
+  hasPreviousMenu,
+  previousMenuSavedAt,
   onAddDish,
   onEditDish,
   onDeleteDish,
   onClearWeek,
   onGenerateBalancedWeek,
+  onRestorePreviousMenu,
   onOpenShopping,
 }) {
   const [selectedMobileDay, setSelectedMobileDay] = useState('all');
   const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmGenerateModal, setConfirmGenerateModal] = useState(false);
+  const [viewingDishState, setViewingDishState] = useState(null);
 
   const visibleMobileDays =
     selectedMobileDay === 'all' ? DAYS : DAYS.filter((d) => d.id === selectedMobileDay);
@@ -163,6 +362,19 @@ export default function WeeklyCalendar({
   };
 
   const mainDietGroups = DIET_GROUPS.filter((g) => g.id !== 'desayuno_integral');
+
+  const handleRequestGenerate = () => {
+    if (plannedDishesCount > 0) {
+      setConfirmGenerateModal(true);
+    } else {
+      onGenerateBalancedWeek();
+    }
+  };
+
+  const handleConfirmGenerate = () => {
+    setConfirmGenerateModal(false);
+    onGenerateBalancedWeek();
+  };
 
   return (
     <section className="space-y-5">
@@ -186,12 +398,28 @@ export default function WeeklyCalendar({
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={onGenerateBalancedWeek}
+              onClick={handleRequestGenerate}
               className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-3.5 py-2 text-xs font-bold text-white shadow-sm transition hover:from-emerald-700 hover:to-teal-700 sm:text-sm"
             >
               <Sparkles className="h-4 w-4" />
               <span>Generar menú equilibrado (2 pers.)</span>
             </button>
+
+            {hasPreviousMenu && (
+              <button
+                type="button"
+                onClick={onRestorePreviousMenu}
+                title={
+                  previousMenuSavedAt
+                    ? `Recuperar el menú anterior (guardado a las ${new Date(previousMenuSavedAt).toLocaleTimeString('es-ES')})`
+                    : 'Recuperar el menú anterior'
+                }
+                className="inline-flex items-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900 transition hover:bg-amber-100 sm:text-sm"
+              >
+                <Undo2 className="h-4 w-4 text-amber-700" />
+                <span>Recuperar menú anterior</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -327,6 +555,9 @@ export default function WeeklyCalendar({
                       onAddDish={onAddDish}
                       onEditDish={onEditDish}
                       onDeleteDish={onDeleteDish}
+                      onViewRecipe={(dId, mId, dishObj) =>
+                        setViewingDishState({ dayId: dId, mealId: mId, dish: dishObj })
+                      }
                     />
                   ))}
                 </div>
@@ -363,6 +594,9 @@ export default function WeeklyCalendar({
                     onAddDish={onAddDish}
                     onEditDish={onEditDish}
                     onDeleteDish={onDeleteDish}
+                    onViewRecipe={(dId, mId, dishObj) =>
+                      setViewingDishState({ dayId: dId, mealId: mId, dish: dishObj })
+                    }
                     compact
                   />
                 ))}
@@ -371,6 +605,64 @@ export default function WeeklyCalendar({
           );
         })}
       </div>
+      {confirmGenerateModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 p-0 backdrop-blur-sm sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-generate-title"
+        >
+          <div className="w-full max-w-md overflow-hidden rounded-t-2xl bg-white p-5 shadow-2xl sm:rounded-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-700">
+                  <AlertTriangle className="h-5 w-5" />
+                </div>
+                <div>
+                  <h2 id="confirm-generate-title" className="text-base font-extrabold text-slate-900">
+                    ¿Sobrescribir el menú actual?
+                  </h2>
+                  <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                    Al generar un nuevo menú equilibrado se sustituirán los <strong>{plannedDishesCount} platos</strong> actuales de la semana. Guardaremos una copia del menú actual para que puedas recuperarlo pulsando <strong>«Recuperar menú anterior»</strong> si cambias de opinión.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmGenerateModal(false)}
+                aria-label="Cerrar"
+                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmGenerateModal(false)}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 sm:text-sm"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmGenerate}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 sm:text-sm"
+              >
+                <Sparkles className="h-4 w-4" />
+                Sí, sobrescribir y generar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <RecipeDetailModal
+        viewingState={viewingDishState}
+        recipes={recipes}
+        onClose={() => setViewingDishState(null)}
+        onEditDish={onEditDish}
+      />
     </section>
   );
 }

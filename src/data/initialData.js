@@ -1,6 +1,7 @@
 export const STORAGE_KEYS = {
   RECIPES: 'menuplan_recipes_v1',
   WEEKLY_MENU: 'menuplan_weekly_menu_v1',
+  PREVIOUS_MENU: 'menuplan_previous_menu_v1',
   SHOPPING_STATE: 'menuplan_shopping_state_v1',
 };
 
@@ -206,6 +207,9 @@ export function createDishFromRecipe(recipe, servings = DEFAULT_SERVINGS) {
     name: recipe.name,
     servings: targetServings,
     dietGroup: recipe.dietGroup || inferDietGroup(recipe),
+    prepTime: recipe.prepTime || 20,
+    description: recipe.description || '',
+    steps: Array.isArray(recipe.steps) ? [...recipe.steps] : [],
     notes: '',
     ingredients: scaleIngredients(recipe.ingredients, recipe.servings || DEFAULT_SERVINGS, targetServings),
   };

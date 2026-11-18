@@ -19,5 +19,17 @@
   <body class="bg-slate-50 text-slate-900 antialiased selection:bg-emerald-100 selection:text-emerald-900">
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+    <script>
+      (function () {
+        try {
+          var isGitHubPages = /\.github\.io$/i.test(window.location.hostname);
+          var hasUnbuiltEntry = !!document.querySelector('script[src="/src/main.jsx"]');
+          if (isGitHubPages && hasUnbuiltEntry && !/\/docs(\/|$)/.test(window.location.pathname)) {
+            var base = window.location.pathname.replace(/\/index\.html$/i, '').replace(/\/+$/, '');
+            window.location.replace(base + '/docs/' + window.location.search + window.location.hash);
+          }
+        } catch (e) {}
+      })();
+    </script>
   </body>
 </html>

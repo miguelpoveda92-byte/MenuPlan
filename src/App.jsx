@@ -46,6 +46,10 @@ export default function App() {
   const [weeklyMenu, setWeeklyMenu] = useLocalStorage(STORAGE_KEYS.WEEKLY_MENU, () =>
     generateBalancedWeeklyMenu(INITIAL_RECIPES, DEFAULT_SERVINGS),
   );
+  const [previousMenuSnapshot, setPreviousMenuSnapshot] = useLocalStorage(
+    STORAGE_KEYS.PREVIOUS_MENU,
+    null,
+  );
   const [shoppingState, setShoppingState] = useLocalStorage(
     STORAGE_KEYS.SHOPPING_STATE,
     DEFAULT_SHOPPING_STATE,
@@ -84,8 +88,18 @@ export default function App() {
   }, []);
 
   // Referencias para sincronización bidireccional segura sin bucles
-  const latestStateRef = useRef({ recipes, weeklyMenu, shoppingState });
-  latestStateRef.current = { recipes, weeklyMenu, shoppingState };
+  const latestStateRef = useRef({
+    recipes,
+    weeklyMenu,
+    previousMenuSnapshot,
+    shoppingState,
+  });
+  latestStateRef.current = {
+    recipes,
+    weeklyMenu,
+    previousMenuSnapshot,
+    shoppingState,
+  };
 
   const lastKnownRemoteTsRef = useRef(0);
   const dirtyRevisionRef = useRef(0);
@@ -111,14 +125,20 @@ export default function App() {
           if (shouldApply) {
             const nextRecipes = normalizeRecipesList(remote.recipes);
             const nextMenu = remote.weeklyMenu;
+            const nextPrevSnapshot =
+              remote.previousMenuSnapshot !== undefined
+                ? remote.previousMenuSnapshot
+                : latestStateRef.current.previousMenuSnapshot;
             const nextShopping = remote.shoppingState || DEFAULT_SHOPPING_STATE;
 
             setRecipes(nextRecipes);
             setWeeklyMenu(nextMenu);
+            setPreviousMenuSnapshot(nextPrevSnapshot);
             setShoppingState(nextShopping);
             latestStateRef.current = {
               recipes: nextRecipes,
               weeklyMenu: nextMenu,
+              previousMenuSnapshot: nextPrevSnapshot,
               shoppingState: nextShopping,
             };
 
@@ -151,11 +171,20 @@ export default function App() {
         setSyncStatus('offline');
       }
     },
-    [syncRoomId, customSyncUrl, normalizeRecipesList, setRecipes, setWeeklyMenu, setShoppingState, showToast],
+    [
+      syncRoomId,
+      customSyncUrl,
+      normalizeRecipesList,
+      setRecipes,
+      setWeeklyMenu,
+      setPreviousMenuSnapshot,
+      setShoppingState,
+      showToast,
+    ],
   );
 
   const scheduleCloudPush = useCallback(
-    (nextRecipes, nextMenu, nextShopping) => {
+    (nextRecipes, nextMenu, nextShopping, nextPrevSnapshot = latestStateRef.current.previousMenuSnapshot) => {
       dirtyRevisionRef.current += 1;
       const myRevision = dirtyRevisionRef.current;
       setSyncStatus('saving');
@@ -172,6 +201,7 @@ export default function App() {
             {
               recipes: nextRecipes,
               weeklyMenu: nextMenu,
+              previousMenuSnapshot: nextPrevSnapshot,
               shoppingState: nextShopping,
               updatedAt: stamp,
               updatedBy: 'MenuPlan',
@@ -342,19 +372,58 @@ export default function App() {
     showToast('Plato eliminado del calendario compartido');
   };
 
+  const countMenuDishes = useCallback((menuObj) => {
+    let count = 0;
+    for (const day of DAYS) {
+      for (const meal of MEAL_TYPES) {
+        count += menuObj?.[day.id]?.[meal.id]?.length || 0;
+      }
+    }
+    return count;
+  }, []);
+
   const handleClearWeek = () => {
+    const currentMenu = latestStateRef.current.weeklyMenu;
+    if (countMenuDishes(currentMenu) > 0) {
+      const backup = { menu: currentMenu, savedAt: Date.now() };
+      latestStateRef.current.previousMenuSnapshot = backup;
+      setPreviousMenuSnapshot(backup);
+    }
     applyMenuChange(createEmptyMenu());
-    showToast('Calendario semanal vaciado');
+    showToast('Calendario semanal vaciado (puedes recuperar el menú anterior)');
   };
 
   const handleGenerateBalancedWeek = () => {
+    const currentMenu = latestStateRef.current.weeklyMenu;
+    if (countMenuDishes(currentMenu) > 0) {
+      const backup = { menu: currentMenu, savedAt: Date.now() };
+      latestStateRef.current.previousMenuSnapshot = backup;
+      setPreviousMenuSnapshot(backup);
+    }
+
     const currentRecipes = latestStateRef.current.recipes;
     const sourceRecipes = currentRecipes.length > 0 ? currentRecipes : INITIAL_RECIPES;
     if (currentRecipes.length === 0) {
       applyRecipesChange(INITIAL_RECIPES);
     }
     applyMenuChange(generateBalancedWeeklyMenu(sourceRecipes, DEFAULT_SERVINGS));
-    showToast('Menú semanal equilibrado generado y compartido (2 personas)');
+    showToast('Nuevo menú equilibrado generado (el anterior sigue recuperable)');
+  };
+
+  const handleRestorePreviousMenu = () => {
+    const snapshot = latestStateRef.current.previousMenuSnapshot;
+    if (!snapshot?.menu) return;
+
+    const currentMenu = latestStateRef.current.weeklyMenu;
+    const nextBackup =
+      countMenuDishes(currentMenu) > 0
+        ? { menu: currentMenu, savedAt: Date.now() }
+        : null;
+
+    latestStateRef.current.previousMenuSnapshot = nextBackup;
+    setPreviousMenuSnapshot(nextBackup);
+    applyMenuChange(snapshot.menu);
+    showToast('Menú anterior recuperado y sincronizado');
   };
 
   const handleAddRecipe = (recipeData) => {
@@ -502,14 +571,18 @@ export default function App() {
         {activeTab === 'calendar' && (
           <WeeklyCalendar
             weeklyMenu={weeklyMenu}
+            recipes={recipes}
             plannedDishesCount={plannedDishesCount}
             definitiveShoppingCount={definitiveShoppingCount}
             dietBalance={dietBalance}
+            hasPreviousMenu={Boolean(previousMenuSnapshot?.menu)}
+            previousMenuSavedAt={previousMenuSnapshot?.savedAt || null}
             onAddDish={handleOpenAddDish}
             onEditDish={handleOpenEditDish}
             onDeleteDish={handleDeleteDish}
             onClearWeek={handleClearWeek}
             onGenerateBalancedWeek={handleGenerateBalancedWeek}
+            onRestorePreviousMenu={handleRestorePreviousMenu}
             onOpenShopping={() => setActiveTab('shopping')}
           />
         )}

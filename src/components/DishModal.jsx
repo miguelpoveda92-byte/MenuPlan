@@ -151,7 +151,9 @@ export default function DishModal({
   const [name, setName] = useState('');
   const [servings, setServings] = useState(DEFAULT_SERVINGS);
   const [dietGroup, setDietGroup] = useState('verduras');
+  const [prepTime, setPrepTime] = useState(20);
   const [notes, setNotes] = useState('');
+  const [stepsText, setStepsText] = useState('');
   const [recipeId, setRecipeId] = useState(null);
   const [ingredients, setIngredients] = useState([]);
   const [alsoSaveRecipe, setAlsoSaveRecipe] = useState(false);
@@ -159,13 +161,21 @@ export default function DishModal({
   useEffect(() => {
     if (!isOpen) return;
     if (dishToEdit) {
+      const linked = recipes.find(
+        (r) =>
+          (dishToEdit.recipeId && r.id === dishToEdit.recipeId) ||
+          r.name.trim().toLowerCase() === (dishToEdit.name || '').trim().toLowerCase(),
+      );
       setMode('custom');
       setName(dishToEdit.name || '');
       setServings(dishToEdit.servings || DEFAULT_SERVINGS);
       setDietGroup(
         dishToEdit.dietGroup || inferDietGroup({ ...dishToEdit, mealCategory: mealId }),
       );
+      setPrepTime(dishToEdit.prepTime || linked?.prepTime || 20);
       setNotes(dishToEdit.notes || '');
+      const existingSteps = dishToEdit.steps?.length ? dishToEdit.steps : linked?.steps || [];
+      setStepsText(existingSteps.join('\n'));
       setRecipeId(dishToEdit.recipeId || null);
       setIngredients((dishToEdit.ingredients || []).map((ing) => ({ ...ing })));
       setAlsoSaveRecipe(false);
@@ -176,12 +186,14 @@ export default function DishModal({
       setName('');
       setServings(DEFAULT_SERVINGS);
       setDietGroup(mealId === 'desayuno' ? 'desayuno_integral' : 'verduras');
+      setPrepTime(20);
       setNotes('');
+      setStepsText('');
       setRecipeId(null);
       setIngredients([]);
       setAlsoSaveRecipe(false);
     }
-  }, [isOpen, dishToEdit, recipes.length, mealId]);
+  }, [isOpen, dishToEdit, recipes, mealId]);
 
   const dayMeta = DAYS.find((d) => d.id === dayId);
   const mealMeta = MEAL_TYPES.find((m) => m.id === mealId);
@@ -211,8 +223,10 @@ export default function DishModal({
     setName(recipe.name);
     setServings(DEFAULT_SERVINGS);
     setDietGroup(recipe.dietGroup || inferDietGroup(recipe));
-    setRecipeId(recipe.id);
+    setPrepTime(recipe.prepTime || 20);
     setNotes('');
+    setStepsText((recipe.steps || []).join('\n'));
+    setRecipeId(recipe.id);
     setIngredients(
       scaleIngredients(recipe.ingredients, recipe.servings || DEFAULT_SERVINGS, DEFAULT_SERVINGS),
     );
@@ -239,12 +253,20 @@ export default function DishModal({
         amount: Math.max(0, Number(ing.amount) || 0),
       }));
 
+    const cleanSteps = stepsText
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     const dishPayload = {
       id: dishToEdit ? dishToEdit.id : generateId('dish'),
       recipeId,
       name: cleanName,
       servings: Math.max(1, Number(servings) || DEFAULT_SERVINGS),
       dietGroup,
+      prepTime: Math.max(1, Number(prepTime) || 20),
+      description: dishToEdit?.description || '',
+      steps: cleanSteps,
       notes: notes.trim(),
       ingredients: cleanIngredients,
     };
@@ -254,10 +276,10 @@ export default function DishModal({
         name: cleanName,
         mealCategory: mealId || 'comida',
         dietGroup,
-        prepTime: 20,
+        prepTime: dishPayload.prepTime,
         servings: dishPayload.servings,
         description: notes.trim() || 'Receta guardada desde el calendario semanal.',
-        steps: [],
+        steps: cleanSteps,
         ingredients: cleanIngredients,
       });
       if (createdRecipe) {
@@ -500,6 +522,19 @@ export default function DishModal({
                 onChange={setIngredients}
                 emptyHint="Añade ingredientes a este plato si quieres que se sumen automáticamente en tu lista de la compra."
               />
+
+              <div>
+                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                  Pasos de preparación (opcional, uno por línea)
+                </label>
+                <textarea
+                  rows="3"
+                  value={stepsText}
+                  onChange={(e) => setStepsText(e.target.value)}
+                  placeholder={'1. Cortar y saltear las verduras.\n2. Cocinar a fuego medio 15 minutos.'}
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-800 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                />
+              </div>
 
               {!isEditing && !recipeId && (
                 <label className="flex cursor-pointer items-center gap-2.5 rounded-xl border border-emerald-200/80 bg-emerald-50/60 px-3.5 py-2.5 text-xs font-semibold text-emerald-900">
