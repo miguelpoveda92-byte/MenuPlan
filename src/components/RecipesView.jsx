@@ -31,8 +31,8 @@ import {
 } from '../data/initialData';
 import {
   searchInternetRecipes,
-  extractRecipeFromPdf,
-  parseRecipeTextToStructured,
+  extractRecipesFromPdfFiles,
+  parseMultipleRecipesFromText,
   generateSampleRecipePdfBlob,
 } from '../utils/recipeServices';
 import { IngredientListEditor } from './DishModal';
@@ -504,63 +504,102 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
   );
 }
 
-function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
+function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
   const [parsing, setParsing] = useState(false);
-  const [errorMsg, setErrorMsg] = useState('');
-  const [fileName, setFileName] = useState('');
-  const [scaleInfo, setScaleInfo] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
+  const [errorMsgs, setErrorMsgs] = useState([]);
+  const [loadedFiles, setLoadedFiles] = useState([]);
   const [manualMode, setManualMode] = useState(false);
   const [manualText, setManualText] = useState('');
+  const [expandedDraftId, setExpandedDraftId] = useState(null);
 
-  const [draft, setDraft] = useState(null);
+  const [draftItems, setDraftItems] = useState([]);
 
   useEffect(() => {
     if (!isOpen) {
       setParsing(false);
-      setErrorMsg('');
-      setFileName('');
-      setScaleInfo('');
+      setIsDragging(false);
+      setErrorMsgs([]);
+      setLoadedFiles([]);
       setManualMode(false);
       setManualText('');
-      setDraft(null);
+      setExpandedDraftId(null);
+      setDraftItems([]);
     }
   }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const loadStructuredResult = (parsed) => {
-    setDraft({
-      ...parsed.recipe,
-      stepsText: (parsed.recipe.steps || []).join('\n'),
+  const appendParsedResults = (parsedEntries = []) => {
+    const formatted = parsedEntries.map((entry) => ({
+      draftId: generateId('pdf_draft'),
+      selected: true,
+      sourceFile: entry.sourceFile || 'Receta PDF',
+      originalServings: entry.originalServings,
+      ...entry.recipe,
+      stepsText: (entry.recipe.steps || []).join('\n'),
+    }));
+
+    setDraftItems((prev) => {
+      const merged = [...prev, ...formatted];
+      if (formatted.length === 1 && prev.length === 0) {
+        setExpandedDraftId(formatted[0].draftId);
+      }
+      return merged;
     });
-    setScaleInfo(
-      parsed.originalServings !== DEFAULT_SERVINGS
-        ? `Raciones originales detectadas: ${parsed.originalServings} → cantidades reescaladas automáticamente a 2 personas.`
-        : 'Cantidades ajustadas para 2 personas.',
-    );
   };
 
-  const handleFileChange = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setErrorMsg('');
-    setFileName(file.name);
+  const processFiles = async (fileList) => {
+    const files = Array.from(fileList || []).filter(
+      (f) => f && (f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')),
+    );
+    if (files.length === 0) {
+      setErrorMsgs(['Selecciona o suelta al menos un archivo con extensión .pdf.']);
+      return;
+    }
+
+    setErrorMsgs([]);
+    setLoadedFiles((prev) => Array.from(new Set([...prev, ...files.map((f) => f.name)])));
     setParsing(true);
     try {
-      const parsed = await extractRecipeFromPdf(file);
-      loadStructuredResult(parsed);
-    } catch (err) {
-      setErrorMsg(err.message || 'No se pudo leer el archivo PDF.');
+      const { items, errors } = await extractRecipesFromPdfFiles(files);
+      if (items.length > 0) {
+        appendParsedResults(items);
+      }
+      if (errors.length > 0) {
+        setErrorMsgs(errors.map((e) => `${e.fileName}: ${e.message}`));
+      }
     } finally {
       setParsing(false);
     }
   };
 
+  const handleFileChange = async (e) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      await processFiles(files);
+    }
+    e.target.value = '';
+  };
+
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer?.files?.length) {
+      await processFiles(e.dataTransfer.files);
+    }
+  };
+
   const handleParseManualText = () => {
     if (!manualText.trim()) return;
-    setErrorMsg('');
-    const parsed = parseRecipeTextToStructured(manualText, 'Receta desde texto PDF');
-    loadStructuredResult(parsed);
+    setErrorMsgs([]);
+    const parsedList = parseMultipleRecipesFromText(manualText, 'Texto pegado');
+    if (parsedList.length === 0) {
+      setErrorMsgs(['No se pudo detectar ninguna receta en el texto pegado.']);
+      return;
+    }
+    appendParsedResults(parsedList);
+    setManualText('');
     setManualMode(false);
   };
 
@@ -569,31 +608,51 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'receta_merluza_ejemplo.pdf';
+    link.download = 'recetas_ejemplo_lote.pdf';
     document.body.appendChild(link);
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
   };
 
-  const handleSaveDraft = (e) => {
+  const updateDraftItem = (draftId, patch) => {
+    setDraftItems((prev) =>
+      prev.map((item) => (item.draftId === draftId ? { ...item, ...patch } : item)),
+    );
+  };
+
+  const removeDraftItem = (draftId) => {
+    setDraftItems((prev) => prev.filter((item) => item.draftId !== draftId));
+    if (expandedDraftId === draftId) setExpandedDraftId(null);
+  };
+
+  const selectedCount = draftItems.filter((d) => d.selected && d.name.trim()).length;
+
+  const handleToggleAll = (nextSelected) => {
+    setDraftItems((prev) => prev.map((item) => ({ ...item, selected: nextSelected })));
+  };
+
+  const handleSaveBatch = (e) => {
     e.preventDefault();
-    if (!draft || !draft.name.trim()) return;
-    const finalRecipe = {
-      id: generateId('rec_pdf'),
-      name: draft.name.trim(),
-      mealCategory: draft.mealCategory,
-      dietGroup: draft.dietGroup,
-      prepTime: Math.max(1, Number(draft.prepTime) || 25),
-      servings: Math.max(1, Number(draft.servings) || DEFAULT_SERVINGS),
-      description: draft.description.trim(),
-      ingredients: (draft.ingredients || []).filter((i) => i.name.trim()),
-      steps: (draft.stepsText || '')
-        .split('\n')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    };
-    onSaveRecipe(finalRecipe);
+    const toSave = draftItems
+      .filter((d) => d.selected && d.name.trim())
+      .map((draft) => ({
+        id: generateId('rec_pdf'),
+        name: draft.name.trim(),
+        mealCategory: draft.mealCategory,
+        dietGroup: draft.dietGroup,
+        prepTime: Math.max(1, Number(draft.prepTime) || 25),
+        servings: Math.max(1, Number(draft.servings) || DEFAULT_SERVINGS),
+        description: (draft.description || '').trim(),
+        ingredients: (draft.ingredients || []).filter((i) => i.name.trim()),
+        steps: (draft.stepsText || '')
+          .split('\n')
+          .map((s) => s.trim())
+          .filter(Boolean),
+      }));
+
+    if (toSave.length === 0) return;
+    onSaveRecipesBatch(toSave);
     onClose();
   };
 
@@ -604,17 +663,17 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
       aria-modal="true"
       aria-labelledby="pdf-modal-title"
     >
-      <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl">
+      <div className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
           <div>
             <div className="flex items-center gap-2">
               <FileUp className="h-5 w-5 text-violet-600" />
               <h2 id="pdf-modal-title" className="text-lg font-bold text-slate-900">
-                Convertir PDF en Receta
+                Importar Recetas desde PDF (Lote)
               </h2>
             </div>
             <p className="mt-0.5 text-xs text-slate-500">
-              Sube una receta en PDF y la convertimos automáticamente al formato de MenuPlan para 2 personas.
+              Selecciona o arrastra varios archivos PDF a la vez (o un PDF con varias recetas dentro). Todas se escalan a 2 personas.
             </p>
           </div>
           <button
@@ -628,13 +687,27 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
         </div>
 
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
-          <div className="rounded-2xl border-2 border-dashed border-violet-200 bg-violet-50/50 p-5 text-center">
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragging(true);
+            }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={handleDrop}
+            className={`rounded-2xl border-2 border-dashed p-5 text-center transition ${
+              isDragging
+                ? 'border-violet-500 bg-violet-100/70'
+                : 'border-violet-200 bg-violet-50/50'
+            }`}
+          >
             <FileText className="mx-auto h-9 w-9 text-violet-500" />
             <p className="mt-2 text-sm font-bold text-slate-800">
-              {fileName ? `Archivo cargado: ${fileName}` : 'Selecciona un archivo .PDF con tu receta'}
+              {loadedFiles.length > 0
+                ? `${loadedFiles.length} ${loadedFiles.length === 1 ? 'archivo PDF procesado' : 'archivos PDF procesados'}: ${loadedFiles.join(', ')}`
+                : 'Arrastra varios PDF aquí o selecciónalos de una vez'}
             </p>
             <p className="mt-1 text-xs text-slate-500">
-              Detecta título, ingredientes, unidades, raciones y pasos de preparación.
+              Detecta múltiples recetas por archivo, ingredientes, unidades, raciones y pasos de preparación.
             </p>
 
             <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
@@ -644,10 +717,15 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
                 ) : (
                   <FileUp className="h-4 w-4" />
                 )}
-                {parsing ? 'Leyendo PDF...' : 'Seleccionar PDF'}
+                {parsing
+                  ? 'Leyendo PDFs...'
+                  : draftItems.length > 0
+                    ? 'Añadir más PDFs'
+                    : 'Seleccionar uno o varios PDF'}
                 <input
                   type="file"
                   accept="application/pdf,.pdf"
+                  multiple
                   onChange={handleFileChange}
                   className="hidden"
                 />
@@ -659,7 +737,7 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
                 className="inline-flex items-center gap-1.5 rounded-xl border border-violet-200 bg-white px-3.5 py-2 text-xs font-bold text-violet-700 transition hover:bg-violet-50"
               >
                 <Download className="h-4 w-4" />
-                Descargar PDF de ejemplo
+                PDF de ejemplo (3 recetas)
               </button>
 
               <button
@@ -667,27 +745,29 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
                 onClick={() => setManualMode((prev) => !prev)}
                 className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
               >
-                {manualMode ? 'Ocultar texto' : 'Pegar texto del PDF'}
+                {manualMode ? 'Ocultar texto' : 'Pegar texto (1 o varias)'}
               </button>
             </div>
           </div>
 
-          {errorMsg && (
-            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-rose-800">
-              {errorMsg}
+          {errorMsgs.length > 0 && (
+            <div className="space-y-1 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-rose-800">
+              {errorMsgs.map((msg, i) => (
+                <p key={i}>{msg}</p>
+              ))}
             </div>
           )}
 
           {manualMode && (
             <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
               <label className="block text-xs font-bold text-slate-700">
-                Pega el texto copiado desde tu PDF y pulsa &ldquo;Convertir texto&rdquo;:
+                Pega el texto de una o varias recetas (separadas con <code>Título:</code> o <code>---</code>):
               </label>
               <textarea
                 rows="5"
                 value={manualText}
                 onChange={(e) => setManualText(e.target.value)}
-                placeholder={'Título: Pollo al horno\nPara 4 personas\nIngredientes:\n- 600 g de pollo\n- 2 patatas\nPreparación:\n1. Hornear 30 min.'}
+                placeholder={'Título: Pollo al horno\nPara 4 personas\nIngredientes:\n- 600 g de pollo\n---\nTítulo: Lentejas rápidas\nPara 2 personas\nIngredientes:\n- 200 g de lentejas'}
                 className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 focus:border-violet-500 focus:outline-none"
               />
               <button
@@ -696,88 +776,210 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
                 className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-slate-800"
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                Convertir texto a receta (2 pers.)
+                Detectar y añadir al lote (2 pers.)
               </button>
             </div>
           )}
 
-          {draft && (
-            <form id="pdf-recipe-form" onSubmit={handleSaveDraft} className="space-y-4 border-t border-slate-200 pt-4">
-              {scaleInfo && (
-                <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 px-3.5 py-2.5 text-xs font-semibold text-emerald-900">
-                  {scaleInfo}
+          {draftItems.length > 0 && (
+            <form id="pdf-batch-form" onSubmit={handleSaveBatch} className="space-y-3 border-t border-slate-200 pt-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-extrabold text-slate-900">
+                    Recetas detectadas ({draftItems.length})
+                  </span>
+                  <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-bold text-emerald-700 ring-1 ring-emerald-200">
+                    {selectedCount} seleccionadas
+                  </span>
                 </div>
-              )}
-
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
-                <div className="sm:col-span-6">
-                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
-                    Nombre detectado *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={draft.name}
-                    onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-900 focus:border-emerald-500 focus:outline-none"
-                  />
-                </div>
-                <div className="sm:col-span-3">
-                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
-                    Comida
-                  </label>
-                  <select
-                    value={draft.mealCategory}
-                    onChange={(e) => setDraft({ ...draft, mealCategory: e.target.value })}
-                    className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm font-medium text-slate-800"
+                <div className="flex items-center gap-2 text-xs font-semibold">
+                  <button
+                    type="button"
+                    onClick={() => handleToggleAll(true)}
+                    className="text-emerald-700 hover:underline"
                   >
-                    {MEAL_TYPES.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="sm:col-span-3">
-                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
-                    Grupo dieta
-                  </label>
-                  <select
-                    value={draft.dietGroup}
-                    onChange={(e) => setDraft({ ...draft, dietGroup: e.target.value })}
-                    className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm font-medium text-slate-800"
+                    Marcar todas
+                  </button>
+                  <span className="text-slate-300">|</span>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleAll(false)}
+                    className="text-slate-500 hover:underline"
                   >
-                    {DIET_GROUPS.map((g) => (
-                      <option key={g.id} value={g.id}>
-                        {g.label}
-                      </option>
-                    ))}
-                  </select>
+                    Desmarcar
+                  </button>
+                  <span className="text-slate-300">|</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDraftItems([]);
+                      setLoadedFiles([]);
+                    }}
+                    className="text-rose-600 hover:underline"
+                  >
+                    Limpiar lista
+                  </button>
                 </div>
               </div>
 
-              <IngredientListEditor
-                ingredients={draft.ingredients || []}
-                onChange={(nextIngs) => setDraft({ ...draft, ingredients: nextIngs })}
-                emptyHint="No se detectaron líneas de ingredientes con formato estándar; puedes añadirlos aquí."
-              />
+              <div className="space-y-2.5">
+                {draftItems.map((draft) => {
+                  const isExpanded = expandedDraftId === draft.draftId;
+                  const dietMeta = DIET_GROUPS.find((g) => g.id === draft.dietGroup);
+                  return (
+                    <div
+                      key={draft.draftId}
+                      className={`rounded-xl border transition ${
+                        draft.selected
+                          ? 'border-emerald-200 bg-white shadow-soft'
+                          : 'border-slate-200 bg-slate-50/70 opacity-75'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2 p-3.5">
+                        <label className="flex min-w-0 flex-1 cursor-pointer items-start gap-3">
+                          <input
+                            type="checkbox"
+                            checked={draft.selected}
+                            onChange={(e) =>
+                              updateDraftItem(draft.draftId, { selected: e.target.checked })
+                            }
+                            className="mt-1 h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-bold text-slate-900">
+                              {draft.name}
+                            </p>
+                            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
+                              <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-600">
+                                {draft.sourceFile}
+                              </span>
+                              {dietMeta && (
+                                <span
+                                  className={`rounded-full border px-2 py-0.5 font-bold ${dietMeta.badgeClass}`}
+                                >
+                                  {dietMeta.label}
+                                </span>
+                              )}
+                              <span className="font-semibold text-slate-500">
+                                {(draft.ingredients || []).length} ingred.
+                              </span>
+                              {draft.originalServings !== DEFAULT_SERVINGS && (
+                                <span className="font-semibold text-emerald-700">
+                                  ({draft.originalServings} → 2 pers.)
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </label>
 
-              <div>
-                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
-                  Pasos detectados
-                </label>
-                <textarea
-                  rows="3"
-                  value={draft.stepsText}
-                  onChange={(e) => setDraft({ ...draft, stepsText: e.target.value })}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-800 focus:border-emerald-500 focus:outline-none"
-                />
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedDraftId(isExpanded ? null : draft.draftId)
+                            }
+                            className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                          >
+                            {isExpanded ? 'Cerrar edición' : 'Editar'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removeDraftItem(draft.draftId)}
+                            aria-label={`Quitar ${draft.name}`}
+                            className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {isExpanded && (
+                        <div className="space-y-3 border-t border-slate-100 bg-slate-50/50 p-3.5">
+                          <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
+                            <div className="sm:col-span-6">
+                              <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                                Nombre *
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={draft.name}
+                                onChange={(e) =>
+                                  updateDraftItem(draft.draftId, { name: e.target.value })
+                                }
+                                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 focus:border-emerald-500 focus:outline-none"
+                              />
+                            </div>
+                            <div className="sm:col-span-3">
+                              <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                                Comida
+                              </label>
+                              <select
+                                value={draft.mealCategory}
+                                onChange={(e) =>
+                                  updateDraftItem(draft.draftId, { mealCategory: e.target.value })
+                                }
+                                className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm font-medium text-slate-800"
+                              >
+                                {MEAL_TYPES.map((m) => (
+                                  <option key={m.id} value={m.id}>
+                                    {m.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="sm:col-span-3">
+                              <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                                Grupo dieta
+                              </label>
+                              <select
+                                value={draft.dietGroup}
+                                onChange={(e) =>
+                                  updateDraftItem(draft.draftId, { dietGroup: e.target.value })
+                                }
+                                className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm font-medium text-slate-800"
+                              >
+                                {DIET_GROUPS.map((g) => (
+                                  <option key={g.id} value={g.id}>
+                                    {g.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+
+                          <IngredientListEditor
+                            ingredients={draft.ingredients || []}
+                            onChange={(nextIngs) =>
+                              updateDraftItem(draft.draftId, { ingredients: nextIngs })
+                            }
+                            emptyHint="No se detectaron líneas de ingredientes con formato estándar; puedes añadirlos aquí."
+                          />
+
+                          <div>
+                            <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                              Pasos detectados
+                            </label>
+                            <textarea
+                              rows="3"
+                              value={draft.stepsText}
+                              onChange={(e) =>
+                                updateDraftItem(draft.draftId, { stepsText: e.target.value })
+                              }
+                              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:border-emerald-500 focus:outline-none"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </form>
           )}
         </div>
 
-        {draft && (
+        {draftItems.length > 0 && (
           <div className="flex items-center justify-end gap-2.5 border-t border-slate-200 bg-slate-50 px-5 py-3.5">
             <button
               type="button"
@@ -788,11 +990,14 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
             </button>
             <button
               type="submit"
-              form="pdf-recipe-form"
-              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-5 py-2 text-sm font-bold text-white shadow-sm hover:bg-emerald-700"
+              form="pdf-batch-form"
+              disabled={selectedCount === 0}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-5 py-2 text-sm font-bold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Check className="h-4 w-4" />
-              Guardar en mi recetario (2 pers.)
+              {selectedCount === 1
+                ? 'Guardar 1 receta (2 pers.)'
+                : `Guardar ${selectedCount} recetas (2 pers.)`}
             </button>
           </div>
         )}
@@ -804,6 +1009,7 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipe }) {
 export default function RecipesView({
   recipes,
   onAddRecipe,
+  onAddRecipesBatch,
   onUpdateRecipe,
   onDeleteRecipe,
   onAssignRecipeToMenu,
@@ -1192,7 +1398,7 @@ export default function RecipesView({
       <PdfImportModal
         isOpen={pdfModalOpen}
         onClose={() => setPdfModalOpen(false)}
-        onSaveRecipe={onAddRecipe}
+        onSaveRecipesBatch={onAddRecipesBatch || ((list) => list.forEach(onAddRecipe))}
       />
 
       {assigningRecipe && (

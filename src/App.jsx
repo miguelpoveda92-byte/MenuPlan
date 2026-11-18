@@ -1,5 +1,13 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react';
-import { CheckCircle2 } from 'lucide-react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import {
+  CheckCircle2,
+  Cloud,
+  RefreshCw,
+  X,
+  Copy,
+  Check,
+  Users,
+} from 'lucide-react';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import {
   STORAGE_KEYS,
@@ -14,6 +22,12 @@ import {
   generateId,
   inferDietGroup,
 } from './data/initialData';
+import {
+  DEFAULT_SYNC_ROOM_ID,
+  SYNC_STORAGE_KEYS,
+  fetchSharedState,
+  pushSharedState,
+} from './utils/cloudSync';
 import Navbar from './components/Navbar';
 import WeeklyCalendar from './components/WeeklyCalendar';
 import DishModal from './components/DishModal';
@@ -37,27 +51,21 @@ export default function App() {
     DEFAULT_SHOPPING_STATE,
   );
 
-  // Asegurar compatibilidad con datos previos en localStorage (añadir nuevas recetas base y grupos dietéticos)
-  useEffect(() => {
-    setRecipes((prev) => {
-      if (!Array.isArray(prev) || prev.length === 0) return INITIAL_RECIPES;
-      const existingIds = new Set(prev.map((r) => r.id));
-      let changed = false;
-      const upgraded = prev.map((r) => {
-        if (!r.dietGroup) {
-          changed = true;
-          return { ...r, dietGroup: inferDietGroup(r) };
-        }
-        return r;
-      });
-      const missingDefaults = INITIAL_RECIPES.filter((r) => !existingIds.has(r.id));
-      if (missingDefaults.length > 0) {
-        changed = true;
-        upgraded.push(...missingDefaults);
-      }
-      return changed ? upgraded : prev;
-    });
-  }, [setRecipes]);
+  const [syncRoomId, setSyncRoomId] = useLocalStorage(
+    SYNC_STORAGE_KEYS.ROOM_ID,
+    DEFAULT_SYNC_ROOM_ID,
+  );
+  const [customSyncUrl, setCustomSyncUrl] = useLocalStorage(
+    SYNC_STORAGE_KEYS.GAS_SYNC_URL,
+    '',
+  );
+
+  const [syncStatus, setSyncStatus] = useState('syncing');
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
+  const [roomInput, setRoomInput] = useState(syncRoomId);
+  const [gasSyncInput, setGasSyncInput] = useState(customSyncUrl);
+  const [copiedRoom, setCopiedRoom] = useState(false);
 
   const [dishModalState, setDishModalState] = useState({
     isOpen: false,
@@ -74,6 +82,188 @@ export default function App() {
       setToast((current) => (current && Date.now() - current.id >= 2600 ? null : current));
     }, 2800);
   }, []);
+
+  // Referencias para sincronización bidireccional segura sin bucles
+  const latestStateRef = useRef({ recipes, weeklyMenu, shoppingState });
+  latestStateRef.current = { recipes, weeklyMenu, shoppingState };
+
+  const lastKnownRemoteTsRef = useRef(0);
+  const dirtyRevisionRef = useRef(0);
+  const pushTimerRef = useRef(null);
+
+  const normalizeRecipesList = useCallback((list) => {
+    if (!Array.isArray(list) || list.length === 0) return INITIAL_RECIPES;
+    return list.map((r) => (r.dietGroup ? r : { ...r, dietGroup: inferDietGroup(r) }));
+  }, []);
+
+  const pullFromCloud = useCallback(
+    async ({ notifyIfChanged = false, forceApply = false } = {}) => {
+      setSyncStatus((prev) => (prev === 'saving' ? prev : 'syncing'));
+      try {
+        const remote = await fetchSharedState(syncRoomId, customSyncUrl);
+        if (remote) {
+          const remoteTs = Number(remote.updatedAt) || 0;
+          const shouldApply =
+            forceApply ||
+            lastKnownRemoteTsRef.current === 0 ||
+            (remoteTs > lastKnownRemoteTsRef.current && dirtyRevisionRef.current === 0);
+
+          if (shouldApply) {
+            const nextRecipes = normalizeRecipesList(remote.recipes);
+            const nextMenu = remote.weeklyMenu;
+            const nextShopping = remote.shoppingState || DEFAULT_SHOPPING_STATE;
+
+            setRecipes(nextRecipes);
+            setWeeklyMenu(nextMenu);
+            setShoppingState(nextShopping);
+            latestStateRef.current = {
+              recipes: nextRecipes,
+              weeklyMenu: nextMenu,
+              shoppingState: nextShopping,
+            };
+
+            const hadPriorSync = lastKnownRemoteTsRef.current > 0 && remoteTs > lastKnownRemoteTsRef.current;
+            lastKnownRemoteTsRef.current = remoteTs || Date.now();
+            if (notifyIfChanged && hadPriorSync) {
+              showToast('Menú actualizado con los cambios compartidos');
+            }
+          }
+          setSyncStatus('synced');
+          setLastSyncedAt(Date.now());
+        } else {
+          // Sala vacía nueva: inicializar con el estado actual
+          const current = latestStateRef.current;
+          const stamp = Date.now();
+          await pushSharedState(
+            syncRoomId,
+            {
+              ...current,
+              updatedAt: stamp,
+              updatedBy: 'MenuPlan',
+            },
+            customSyncUrl,
+          );
+          lastKnownRemoteTsRef.current = stamp;
+          setSyncStatus('synced');
+          setLastSyncedAt(Date.now());
+        }
+      } catch {
+        setSyncStatus('offline');
+      }
+    },
+    [syncRoomId, customSyncUrl, normalizeRecipesList, setRecipes, setWeeklyMenu, setShoppingState, showToast],
+  );
+
+  const scheduleCloudPush = useCallback(
+    (nextRecipes, nextMenu, nextShopping) => {
+      dirtyRevisionRef.current += 1;
+      const myRevision = dirtyRevisionRef.current;
+      setSyncStatus('saving');
+
+      if (pushTimerRef.current) {
+        clearTimeout(pushTimerRef.current);
+      }
+
+      pushTimerRef.current = setTimeout(async () => {
+        const stamp = Math.max(Date.now(), lastKnownRemoteTsRef.current + 1);
+        try {
+          await pushSharedState(
+            syncRoomId,
+            {
+              recipes: nextRecipes,
+              weeklyMenu: nextMenu,
+              shoppingState: nextShopping,
+              updatedAt: stamp,
+              updatedBy: 'MenuPlan',
+            },
+            customSyncUrl,
+          );
+          lastKnownRemoteTsRef.current = stamp;
+          if (dirtyRevisionRef.current === myRevision) {
+            dirtyRevisionRef.current = 0;
+            setSyncStatus('synced');
+            setLastSyncedAt(Date.now());
+          }
+        } catch {
+          setSyncStatus('offline');
+        }
+      }, 450);
+    },
+    [syncRoomId, customSyncUrl],
+  );
+
+  // Sincronización inicial, al volver a la pestaña y cada 15 segundos
+  useEffect(() => {
+    pullFromCloud({ notifyIfChanged: false, forceApply: true });
+
+    const intervalId = setInterval(() => {
+      pullFromCloud({ notifyIfChanged: true });
+    }, 15000);
+
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        pullFromCloud({ notifyIfChanged: true });
+      }
+    };
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    return () => {
+      clearInterval(intervalId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+    };
+  }, [pullFromCloud]);
+
+  const applyRecipesChange = useCallback(
+    (updater) => {
+      const prev = latestStateRef.current.recipes;
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      latestStateRef.current.recipes = next;
+      setRecipes(next);
+      scheduleCloudPush(
+        next,
+        latestStateRef.current.weeklyMenu,
+        latestStateRef.current.shoppingState,
+      );
+      return next;
+    },
+    [setRecipes, scheduleCloudPush],
+  );
+
+  const applyMenuChange = useCallback(
+    (updater) => {
+      const prev = latestStateRef.current.weeklyMenu;
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      latestStateRef.current.weeklyMenu = next;
+      setWeeklyMenu(next);
+      scheduleCloudPush(
+        latestStateRef.current.recipes,
+        next,
+        latestStateRef.current.shoppingState,
+      );
+      return next;
+    },
+    [setWeeklyMenu, scheduleCloudPush],
+  );
+
+  const applyShoppingChange = useCallback(
+    (updater) => {
+      const prev = latestStateRef.current.shoppingState;
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      latestStateRef.current.shoppingState = next;
+      setShoppingState(next);
+      scheduleCloudPush(
+        latestStateRef.current.recipes,
+        latestStateRef.current.weeklyMenu,
+        next,
+      );
+      return next;
+    },
+    [setShoppingState, scheduleCloudPush],
+  );
 
   const plannedDishesCount = useMemo(() => {
     let count = 0;
@@ -116,7 +306,7 @@ export default function App() {
   };
 
   const handleSaveDish = (dayId, mealId, dishPayload, isEditing) => {
-    setWeeklyMenu((prev) => {
+    applyMenuChange((prev) => {
       const safeDay = prev[dayId] || { desayuno: [], comida: [], cena: [] };
       const currentList = safeDay[mealId] || [];
       const nextList = isEditing
@@ -131,11 +321,15 @@ export default function App() {
         },
       };
     });
-    showToast(isEditing ? `Plato "${dishPayload.name}" actualizado` : `"${dishPayload.name}" añadido al menú`);
+    showToast(
+      isEditing
+        ? `Plato "${dishPayload.name}" actualizado para ambos`
+        : `"${dishPayload.name}" añadido al menú compartido`,
+    );
   };
 
   const handleDeleteDish = (dayId, mealId, dishId) => {
-    setWeeklyMenu((prev) => {
+    applyMenuChange((prev) => {
       const safeDay = prev[dayId] || { desayuno: [], comida: [], cena: [] };
       return {
         ...prev,
@@ -145,38 +339,53 @@ export default function App() {
         },
       };
     });
-    showToast('Plato eliminado del calendario');
+    showToast('Plato eliminado del calendario compartido');
   };
 
   const handleClearWeek = () => {
-    setWeeklyMenu(createEmptyMenu());
+    applyMenuChange(createEmptyMenu());
     showToast('Calendario semanal vaciado');
   };
 
   const handleGenerateBalancedWeek = () => {
-    const sourceRecipes = recipes.length > 0 ? recipes : INITIAL_RECIPES;
-    if (recipes.length === 0) {
-      setRecipes(INITIAL_RECIPES);
+    const currentRecipes = latestStateRef.current.recipes;
+    const sourceRecipes = currentRecipes.length > 0 ? currentRecipes : INITIAL_RECIPES;
+    if (currentRecipes.length === 0) {
+      applyRecipesChange(INITIAL_RECIPES);
     }
-    setWeeklyMenu(generateBalancedWeeklyMenu(sourceRecipes, DEFAULT_SERVINGS));
-    showToast('Menú semanal equilibrado generado para 2 personas');
+    applyMenuChange(generateBalancedWeeklyMenu(sourceRecipes, DEFAULT_SERVINGS));
+    showToast('Menú semanal equilibrado generado y compartido (2 personas)');
   };
 
   const handleAddRecipe = (recipeData) => {
     const created = { ...recipeData, id: recipeData.id || generateId('rec') };
-    setRecipes((prev) => [created, ...prev]);
-    showToast(`Receta "${created.name}" guardada`);
+    applyRecipesChange((prev) => [created, ...prev]);
+    showToast(`Receta "${created.name}" guardada y compartida`);
     return created;
   };
 
+  const handleAddRecipesBatch = (recipesList = []) => {
+    const valid = recipesList
+      .filter((r) => r && r.name && r.name.trim())
+      .map((r) => ({ ...r, id: r.id || generateId('rec') }));
+    if (valid.length === 0) return [];
+    applyRecipesChange((prev) => [...valid, ...prev]);
+    showToast(
+      valid.length === 1
+        ? `Receta "${valid[0].name}" guardada y compartida`
+        : `${valid.length} recetas importadas y compartidas`,
+    );
+    return valid;
+  };
+
   const handleUpdateRecipe = (updatedRecipe) => {
-    setRecipes((prev) => prev.map((r) => (r.id === updatedRecipe.id ? updatedRecipe : r)));
+    applyRecipesChange((prev) => prev.map((r) => (r.id === updatedRecipe.id ? updatedRecipe : r)));
     showToast(`Receta "${updatedRecipe.name}" actualizada`);
   };
 
   const handleDeleteRecipe = (recipeId) => {
-    setRecipes((prev) => prev.filter((r) => r.id !== recipeId));
-    showToast('Receta eliminada del recetario');
+    applyRecipesChange((prev) => prev.filter((r) => r.id !== recipeId));
+    showToast('Receta eliminada del recetario compartido');
   };
 
   const handleAssignRecipeToMenu = (dayId, mealId, dish) => {
@@ -184,7 +393,7 @@ export default function App() {
   };
 
   const handleMarkAlreadyHave = (ingredientId, name) => {
-    setShoppingState((prev) => ({
+    applyShoppingChange((prev) => ({
       ...prev,
       alreadyHaveIds: Array.from(new Set([...(prev.alreadyHaveIds || []), ingredientId])),
       checkedIds: (prev.checkedIds || []).filter((id) => id !== ingredientId),
@@ -193,23 +402,23 @@ export default function App() {
   };
 
   const handleRestoreIngredient = (ingredientId, name) => {
-    setShoppingState((prev) => ({
+    applyShoppingChange((prev) => ({
       ...prev,
       alreadyHaveIds: (prev.alreadyHaveIds || []).filter((id) => id !== ingredientId),
     }));
-    showToast(`"${name}" restaurado en la lista de la compra`);
+    showToast(`"${name}" restaurado en la lista`);
   };
 
   const handleRestoreAllIngredients = () => {
-    setShoppingState((prev) => ({
+    applyShoppingChange((prev) => ({
       ...prev,
       alreadyHaveIds: [],
     }));
-    showToast('Todos los ingredientes restaurados a la lista');
+    showToast('Todos los ingredientes restaurados');
   };
 
   const handleToggleChecked = (ingredientId) => {
-    setShoppingState((prev) => {
+    applyShoppingChange((prev) => {
       const exists = (prev.checkedIds || []).includes(ingredientId);
       return {
         ...prev,
@@ -221,15 +430,15 @@ export default function App() {
   };
 
   const handleAddExtraItem = (extraItem) => {
-    setShoppingState((prev) => ({
+    applyShoppingChange((prev) => ({
       ...prev,
       extraItems: [...(prev.extraItems || []), extraItem],
     }));
-    showToast(`"${extraItem.name}" añadido a la lista`);
+    showToast(`"${extraItem.name}" añadido a la lista compartida`);
   };
 
   const handleRemoveExtraItem = (manualId) => {
-    setShoppingState((prev) => ({
+    applyShoppingChange((prev) => ({
       ...prev,
       extraItems: (prev.extraItems || []).filter((item) => item.id !== manualId),
     }));
@@ -240,13 +449,41 @@ export default function App() {
     const manualIds = new Set(checkedItems.filter((i) => i.isManual).map((i) => i.manualId));
     const menuIds = checkedItems.filter((i) => !i.isManual).map((i) => i.id);
 
-    setShoppingState((prev) => ({
+    applyShoppingChange((prev) => ({
       ...prev,
       extraItems: (prev.extraItems || []).filter((e) => !manualIds.has(e.id)),
       alreadyHaveIds: Array.from(new Set([...(prev.alreadyHaveIds || []), ...menuIds])),
       checkedIds: [],
     }));
     showToast('Productos marcados retirados de la lista definitiva');
+  };
+
+  const handleOpenSyncModal = () => {
+    setRoomInput(syncRoomId);
+    setGasSyncInput(customSyncUrl);
+    setSyncModalOpen(true);
+  };
+
+  const handleSaveSyncSettings = (e) => {
+    e.preventDefault();
+    const nextRoom = roomInput.trim() || DEFAULT_SYNC_ROOM_ID;
+    const nextGas = gasSyncInput.trim();
+    lastKnownRemoteTsRef.current = 0;
+    dirtyRevisionRef.current = 0;
+    setSyncRoomId(nextRoom);
+    setCustomSyncUrl(nextGas);
+    setSyncModalOpen(false);
+    showToast('Sincronizando con la sala compartida...');
+  };
+
+  const handleCopyRoomCode = async () => {
+    try {
+      await navigator.clipboard.writeText(syncRoomId);
+      setCopiedRoom(true);
+      setTimeout(() => setCopiedRoom(false), 2000);
+    } catch {
+      // ignore clipboard errors
+    }
   };
 
   return (
@@ -257,6 +494,8 @@ export default function App() {
         plannedDishesCount={plannedDishesCount}
         recipesCount={recipes.length}
         definitiveShoppingCount={definitiveShoppingCount}
+        syncStatus={syncStatus}
+        onOpenSyncModal={handleOpenSyncModal}
       />
 
       <main className="mx-auto max-w-7xl px-4 pb-24 pt-5 sm:px-6 sm:pb-12 sm:pt-6 lg:px-8">
@@ -279,6 +518,7 @@ export default function App() {
           <RecipesView
             recipes={recipes}
             onAddRecipe={handleAddRecipe}
+            onAddRecipesBatch={handleAddRecipesBatch}
             onUpdateRecipe={handleUpdateRecipe}
             onDeleteRecipe={handleDeleteRecipe}
             onAssignRecipeToMenu={handleAssignRecipeToMenu}
@@ -312,6 +552,111 @@ export default function App() {
         onSaveDish={handleSaveDish}
         onSaveAsRecipe={handleAddRecipe}
       />
+
+      {syncModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 p-0 backdrop-blur-sm sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="sync-modal-title"
+        >
+          <div className="w-full max-w-lg overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <div className="flex items-center gap-2">
+                <Cloud className="h-5 w-5 text-emerald-600" />
+                <h2 id="sync-modal-title" className="text-lg font-bold text-slate-900">
+                  Sincronización en la Nube
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSyncModalOpen(false)}
+                className="rounded-xl p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveSyncSettings} className="space-y-4 px-5 py-4">
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3.5 text-xs text-emerald-950">
+                <p className="flex items-center gap-1.5 font-bold">
+                  <Users className="h-4 w-4 text-emerald-600" />
+                  Menú, recetas y lista compartidos en tiempo real
+                </p>
+                <p className="mt-1 leading-relaxed text-emerald-900">
+                  Cualquier cambio que hagáis Miguel o Rosa desde el ordenador o el móvil se guarda automáticamente en la nube y aparece en el dispositivo del otro en pocos segundos.
+                </p>
+                {lastSyncedAt && (
+                  <p className="mt-1.5 font-semibold text-emerald-700">
+                    Última sincronización: {new Date(lastSyncedAt).toLocaleTimeString('es-ES')}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                  Código de sala compartida
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={roomInput}
+                    onChange={(e) => setRoomInput(e.target.value)}
+                    className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono text-slate-800 focus:border-emerald-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleCopyRoomCode}
+                    className="inline-flex items-center gap-1 rounded-xl border border-slate-200 px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
+                  >
+                    {copiedRoom ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+                    {copiedRoom ? 'Copiado' : 'Copiar'}
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                  URL Apps Script propia (opcional)
+                </label>
+                <input
+                  type="url"
+                  value={gasSyncInput}
+                  onChange={(e) => setGasSyncInput(e.target.value)}
+                  placeholder="https://script.google.com/macros/s/.../exec (dejar vacío para nube automática)"
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-800 focus:border-emerald-500 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
+                <button
+                  type="button"
+                  onClick={() => pullFromCloud({ notifyIfChanged: false, forceApply: true })}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs font-bold text-emerald-800 hover:bg-emerald-100"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Sincronizar ahora
+                </button>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSyncModalOpen(false)}
+                    className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                  >
+                    Cerrar
+                  </button>
+                  <button
+                    type="submit"
+                    className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-700"
+                  >
+                    Guardar sala
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {toast && (
         <div

@@ -723,7 +723,98 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
   };
 }
 
-export async function extractRecipeFromPdf(file) {
+export function parseMultipleRecipesFromText(rawText = '', fileName = 'Receta PDF') {
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) return [];
+
+  const titleLineRegex = /^(?:t[ií]tulo|receta|nombre|title)\s*:\s*(.+)$/i;
+  const ingredientsHeaderRegex = /^(?:ingredientes|ingredients)\b[:\s-]*$/i;
+  const separatorRegex = /^[-=_*]{3,}$/;
+
+  const titleIndices = [];
+  lines.forEach((line, idx) => {
+    if (titleLineRegex.test(line)) {
+      titleIndices.push(idx);
+    }
+  });
+
+  let blocks = [];
+
+  if (titleIndices.length >= 2) {
+    for (let i = 0; i < titleIndices.length; i += 1) {
+      const start = titleIndices[i];
+      const end = i + 1 < titleIndices.length ? titleIndices[i + 1] : lines.length;
+      blocks.push(lines.slice(start, end).join('\n'));
+    }
+  } else if (lines.some((l) => separatorRegex.test(l))) {
+    let current = [];
+    for (const line of lines) {
+      if (separatorRegex.test(line)) {
+        if (current.length > 0) {
+          blocks.push(current.join('\n'));
+          current = [];
+        }
+      } else {
+        current.push(line);
+      }
+    }
+    if (current.length > 0) blocks.push(current.join('\n'));
+  } else {
+    const ingIndices = [];
+    lines.forEach((line, idx) => {
+      if (ingredientsHeaderRegex.test(line)) {
+        ingIndices.push(idx);
+      }
+    });
+
+    if (ingIndices.length >= 2) {
+      const splitStarts = [0];
+      for (let i = 1; i < ingIndices.length; i += 1) {
+        let candidate = ingIndices[i];
+        // Retroceder hasta 4 líneas buscando el inicio del encabezado (Título / Para X personas / Comida / Tiempo)
+        for (let step = 1; step <= 4 && candidate - 1 > splitStarts[splitStarts.length - 1]; step += 1) {
+          const prevLine = lines[candidate - 1];
+          if (/^\d+[.)]\s+/.test(prevLine) || /^[-•*]\s+/.test(prevLine)) {
+            break;
+          }
+          candidate -= 1;
+          if (titleLineRegex.test(prevLine) || (!/:/.test(prevLine) && prevLine.length <= 80)) {
+            break;
+          }
+        }
+        splitStarts.push(candidate);
+      }
+
+      for (let i = 0; i < splitStarts.length; i += 1) {
+        const start = splitStarts[i];
+        const end = i + 1 < splitStarts.length ? splitStarts[i + 1] : lines.length;
+        blocks.push(lines.slice(start, end).join('\n'));
+      }
+    } else {
+      blocks = [lines.join('\n')];
+    }
+  }
+
+  return blocks
+    .map((blockText, idx) => {
+      const fallbackName =
+        blocks.length > 1
+          ? `${fileName.replace(/\.pdf$/i, '')} (${idx + 1})`
+          : fileName;
+      const parsed = parseRecipeTextToStructured(blockText, fallbackName);
+      return {
+        ...parsed,
+        sourceFile: fileName,
+      };
+    })
+    .filter((entry) => entry.recipe && entry.recipe.name);
+}
+
+export async function extractRawTextFromPdfFile(file) {
   if (!file) {
     throw new Error('No se ha seleccionado ningún archivo PDF.');
   }
@@ -742,7 +833,7 @@ export async function extractRecipeFromPdf(file) {
         fullText += `${textContent.items.map((item) => item.str).join(' ')}\n`;
       }
       if (fullText.trim()) {
-        return parseRecipeTextToStructured(fullText, file.name);
+        return fullText;
       }
     } catch {
       // Continuar con extractor nativo
@@ -797,11 +888,41 @@ export async function extractRecipeFromPdf(file) {
   const combinedText = extractedChunks.join('\n').trim();
   if (!combinedText) {
     throw new Error(
-      'No se pudo extraer texto legible de este PDF (puede ser una imagen escaneada). Puedes pegar o editar la receta manualmente en el formulario.',
+      `No se pudo extraer texto legible de "${file.name}" (puede ser una imagen escaneada).`,
     );
   }
 
+  return combinedText;
+}
+
+export async function extractRecipeFromPdf(file) {
+  const combinedText = await extractRawTextFromPdfFile(file);
   return parseRecipeTextToStructured(combinedText, file.name);
+}
+
+export async function extractRecipesFromPdfFiles(files) {
+  const fileList = Array.from(files || []).filter(Boolean);
+  const items = [];
+  const errors = [];
+
+  for (const file of fileList) {
+    try {
+      const rawText = await extractRawTextFromPdfFile(file);
+      const parsedList = parseMultipleRecipesFromText(rawText, file.name);
+      if (parsedList.length === 0) {
+        errors.push({ fileName: file.name, message: 'No se detectaron recetas válidas.' });
+      } else {
+        items.push(...parsedList);
+      }
+    } catch (err) {
+      errors.push({
+        fileName: file.name,
+        message: err.message || 'No se pudo leer el archivo PDF.',
+      });
+    }
+  }
+
+  return { items, errors };
 }
 
 function escapePdfString(str) {
@@ -812,8 +933,8 @@ function escapePdfString(str) {
 }
 
 /**
- * Genera un archivo PDF válido de ejemplo para probar la función "Importar PDF".
- * Incluye una receta para 4 personas para demostrar el reescalado automático a 2 personas.
+ * Genera un archivo PDF válido de ejemplo con 3 recetas para probar la importación múltiple.
+ * Incluye recetas de 4 y 2 personas para demostrar el reescalado automático a 2 personas.
  */
 export function generateSampleRecipePdfBlob() {
   const lines = [
@@ -827,14 +948,34 @@ export function generateSampleRecipePdfBlob() {
     '- 2 ud de cebolla',
     '- 2 ud de limon',
     '- 4 cda de aceite de oliva virgen',
-    '- 2 diente de ajo',
     'Preparacion:',
     '1. Cortar las patatas y la cebolla en rodajas finas y hornear 15 minutos a 190 C.',
-    '2. Colocar los lomos de merluza encima con ajo laminado y rodajas de limon.',
-    '3. Hornear 12 minutos adicionales hasta que el pescado este jugoso.',
+    '2. Colocar los lomos de merluza encima con rodajas de limon y hornear 12 minutos.',
+    'Titulo: Garbanzos salteados con acelgas y pimenton',
+    'Comida: comida',
+    'Tiempo: 20 min',
+    'Para 4 personas',
+    'Ingredientes:',
+    '- 800 g de garbanzos cocidos',
+    '- 400 g de acelgas frescas',
+    '- 4 diente de ajo',
+    '- 2 cdta de pimenton dulce',
+    'Preparacion:',
+    '1. Rehogar los ajos laminados con el pimenton y saltear las acelgas troceadas.',
+    '2. Incorporar los garbanzos cocidos y cocinar 5 minutos.',
+    'Titulo: Pechuga de pavo a la plancha con calabacin',
+    'Comida: cena',
+    'Tiempo: 15 min',
+    'Para 2 personas',
+    'Ingredientes:',
+    '- 300 g de pechuga de pavo',
+    '- 1 ud de calabacin',
+    '- 2 cda de aceite de oliva virgen',
+    'Preparacion:',
+    '1. Cortar el calabacin en rodajas y dorar a la plancha junto con el pavo.',
   ];
 
-  const ops = ['BT', '/F1 12 Tf', '50 770 Td', '18 TL'];
+  const ops = ['BT', '/F1 10 Tf', '40 800 Td', '14 TL'];
   lines.forEach((line, idx) => {
     const safe = escapePdfString(line);
     if (idx === 0) ops.push(`(${safe}) Tj`);
