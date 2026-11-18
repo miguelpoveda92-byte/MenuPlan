@@ -228,6 +228,13 @@ const ONLINE_SPANISH_RECIPES_DB = [
 export function categorizeIngredientName(name = '') {
   const lower = name.toLowerCase();
   if (
+    /(al gusto|ajo en polvo|aceite|sal\b|pimienta|miel|piment[oó]n|curry|comino|vinagre|mostaza|pesto|salsa|az[uú]car|oil|salt|pepper|honey|spice|vinegar|sauce)/.test(
+      lower,
+    )
+  ) {
+    return 'Condimentos y Otros';
+  }
+  if (
     /(pollo|pavo|salm[oó]n|merluza|bacalao|lubina|dorada|at[uú]n|pescado|carne|ternera|cerdo|gamba|langostino|chicken|turkey|salmon|cod|tuna|fish|beef|pork)/.test(
       lower,
     )
@@ -246,13 +253,6 @@ export function categorizeIngredientName(name = '') {
     )
   ) {
     return 'Despensa y Cereales';
-  }
-  if (
-    /(aceite|sal|pimienta|miel|piment[oó]n|curry|comino|vinagre|mostaza|pesto|salsa|az[uú]car|oil|salt|pepper|honey|spice|vinegar|sauce)/.test(
-      lower,
-    )
-  ) {
-    return 'Condimentos y Otros';
   }
   return 'Frutas y Verduras';
 }
@@ -508,7 +508,9 @@ function extractTextOperatorsFromStream(content) {
   const btBlocks = content.match(/BT[\s\S]*?ET/g) || [content];
   for (const block of btBlocks) {
     const tokens =
-      block.match(/\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|T\*|Td|TD|Tm|TJ|Tj|'|"/g) || [];
+      block.match(
+        /\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+T[dD]|T\*|Tm|TJ|Tj|'|"/g,
+      ) || [];
 
     let pendingBuffer = '';
     for (const token of tokens) {
@@ -523,12 +525,25 @@ function extractTextOperatorsFromStream(content) {
         if (currentLine.trim()) lines.push(currentLine.trim());
         currentLine = pendingBuffer;
         pendingBuffer = '';
-      } else if (token === 'Td' || token === 'TD' || token === 'T*' || token === 'Tm') {
+      } else if (token === 'T*' || token === 'Tm') {
         if (pendingBuffer) {
           currentLine += pendingBuffer;
           pendingBuffer = '';
         }
         if (currentLine.trim()) {
+          lines.push(currentLine.trim());
+          currentLine = '';
+        }
+      } else if (/\s+T[dD]$/.test(token)) {
+        const parts = token.trim().split(/\s+/);
+        const dy = Number(parts[1]) || 0;
+        if (pendingBuffer) {
+          currentLine += pendingBuffer;
+          pendingBuffer = '';
+        }
+        if (Math.abs(dy) < 1) {
+          if (currentLine && !currentLine.endsWith(' ')) currentLine += ' ';
+        } else if (currentLine.trim()) {
           lines.push(currentLine.trim());
           currentLine = '';
         }
@@ -551,16 +566,22 @@ function parseIngredientLine(line) {
     .trim();
   if (!clean || clean.length < 2) return null;
 
+  // Eliminar aclaraciones entre paréntesis al final, ej: "(1/4 de barra de 250 g)" o "(1 cda de postre)"
+  const withoutTrailingNotes = clean.replace(/\s*\([^)]*\)\s*$/g, '').trim();
+  const baseLine = withoutTrailingNotes || clean;
+
   // Formato: "300 g de garbanzos cocidos" o "2 zanahorias" o "200ml leche"
-  const match = clean.match(
+  const match = baseLine.match(
     /^(\d+(?:[.,]\d+)?(?:\s*\/\s*\d+)?)\s*(kg|g|gr|gramos|ml|l|litros|ud|uds|unidades?|cda|cdas|cucharadas?|cdta|cdtas|cucharaditas?|taza|tazas|rebanada|rebanadas|diente|dientes|manojo|manojos|pizca|pizcas)?\s*(?:de\s+)?(.+)$/i,
   );
 
   let amount = 1;
-  let unit = 'ud';
-  let name = clean;
+  let unit = 'pizca';
+  let name = baseLine;
+  let keepFixed = true;
 
   if (match) {
+    keepFixed = false;
     const rawNum = match[1].replace(/\s+/g, '').replace(',', '.');
     if (rawNum.includes('/')) {
       const [a, b] = rawNum.split('/').map(Number);
@@ -580,13 +601,15 @@ function parseIngredientLine(line) {
     else if (/^rebanadas?$/.test(rawUnit)) unit = 'rebanada';
     else if (/^dientes?$/.test(rawUnit)) unit = 'diente';
     else if (/^manojos?$/.test(rawUnit)) unit = 'manojo';
-    else if (/^pizcas?$/.test(rawUnit)) unit = 'pizca';
-    else unit = 'ud';
+    else if (/^pizcas?$/.test(rawUnit)) {
+      unit = 'pizca';
+      keepFixed = true;
+    } else unit = 'ud';
 
     name = match[3].trim();
   }
 
-  name = name.replace(/^[.,:\s]+|[.,:\s]+$/g, '');
+  name = name.replace(/\s*\([^)]*\)\s*$/g, '').replace(/^[.,:\s]+|[.,:\s]+$/g, '');
   if (!name) return null;
 
   return {
@@ -594,15 +617,45 @@ function parseIngredientLine(line) {
     name: name.charAt(0).toUpperCase() + name.slice(1),
     amount,
     unit,
+    keepFixed,
     category: categorizeIngredientName(name),
   };
 }
 
-export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF') {
-  const lines = rawText
+function preprocessPdfLines(rawText = '') {
+  const rawLines = rawText
     .split(/\r?\n/)
     .map((l) => l.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
+
+  const cleaned = [];
+  const splitLabelRegex = /^(t[ií]tulo|receta|nombre|title|comida|categor[ií]a|tipo|tiempo|duraci[oó]n|prep|raciones|porciones|personas|comensales)\s*:\s*$/i;
+
+  for (let i = 0; i < rawLines.length; i += 1) {
+    // Descartar líneas de pie/cabecera de página tipo "... Page 1 of 1" o "Página 1 de 2"
+    let line = rawLines[i].trim();
+    if (
+      !line ||
+      /\b(?:page|p[áa]gina)\s+\d+\s+(?:of|de)\s+\d+\b/i.test(line) ||
+      /^(?:page|p[áa]gina)\s+\d+$/i.test(line)
+    ) {
+      continue;
+    }
+
+    // Unir etiquetas partidas en dos líneas ("Titulo:\nTostada...")
+    if (splitLabelRegex.test(line) && i + 1 < rawLines.length) {
+      line = `${line} ${rawLines[i + 1].trim()}`;
+      i += 1;
+    }
+
+    cleaned.push(line);
+  }
+
+  return cleaned;
+}
+
+export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF') {
+  const lines = preprocessPdfLines(rawText);
 
   const cleanFileName = fileName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || 'Receta importada de PDF';
 
@@ -634,8 +687,10 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
       continue;
     }
 
-    const servingsMeta = line.match(/(?:raciones|porciones|personas|comensales|servings)\s*[:\-]?\s*(\d+)/i) ||
-      line.match(/para\s+(\d+)\s+(?:personas|raciones|comensales)/i);
+    const servingsMeta =
+      line.match(/(?:raciones|porciones|personas?|comensales|servings?)\s*[:\-]?\s*(\d+)/i) ||
+      line.match(/para\s+(\d+)\s+(?:personas?|raciones?|comensales)/i) ||
+      line.match(/^(\d+)\s+(?:personas?|raciones?|comensales)\b/i);
     if (servingsMeta && currentSection === 'header') {
       originalServings = Math.max(1, Number(servingsMeta[1]) || DEFAULT_SERVINGS);
       continue;
@@ -654,6 +709,11 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
       continue;
     }
 
+    // Ignorar pie de página si repite exactamente el título fuera de la cabecera
+    if (currentSection !== 'header' && title && line.toLowerCase() === title.toLowerCase()) {
+      continue;
+    }
+
     if (currentSection === 'header') {
       if (!title && line.length >= 3 && line.length <= 90) {
         title = line;
@@ -669,7 +729,14 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
         rawIngredientLines.push(line);
       }
     } else if (currentSection === 'steps') {
-      rawStepLines.push(line.replace(/^\d+[.)]\s*/, '').trim());
+      const numberedMatch = line.match(/^\d+[.)]\s*(.+)$/);
+      if (numberedMatch) {
+        rawStepLines.push(numberedMatch[1].trim());
+      } else if (rawStepLines.length > 0) {
+        rawStepLines[rawStepLines.length - 1] = `${rawStepLines[rawStepLines.length - 1]} ${line}`.trim();
+      } else {
+        rawStepLines.push(line);
+      }
     }
   }
 
@@ -724,10 +791,7 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
 }
 
 export function parseMultipleRecipesFromText(rawText = '', fileName = 'Receta PDF') {
-  const lines = rawText
-    .split(/\r?\n/)
-    .map((l) => l.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
+  const lines = preprocessPdfLines(rawText);
 
   if (lines.length === 0) return [];
 
@@ -814,6 +878,42 @@ export function parseMultipleRecipesFromText(rawText = '', fileName = 'Receta PD
     .filter((entry) => entry.recipe && entry.recipe.name);
 }
 
+function reconstructLinesFromPdfJsItems(items = []) {
+  const rows = [];
+  for (const item of items) {
+    const str = item.str;
+    if (!str || !str.trim()) continue;
+    const x = item.transform?.[4] ?? 0;
+    const y = item.transform?.[5] ?? 0;
+
+    let row = rows.find((r) => Math.abs(r.y - y) <= 3);
+    if (!row) {
+      row = { y, segments: [] };
+      rows.push(row);
+    }
+    row.segments.push({ x, str, width: item.width || 0 });
+  }
+
+  rows.sort((a, b) => b.y - a.y);
+
+  return rows
+    .map((row) => {
+      row.segments.sort((a, b) => a.x - b.x);
+      let line = '';
+      let lastEndX = null;
+      for (const seg of row.segments) {
+        if (lastEndX !== null && seg.x - lastEndX > 2 && !line.endsWith(' ') && !seg.str.startsWith(' ')) {
+          line += ' ';
+        }
+        line += seg.str;
+        lastEndX = seg.x + seg.width;
+      }
+      return line.replace(/\s+/g, ' ').trim();
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 export async function extractRawTextFromPdfFile(file) {
   if (!file) {
     throw new Error('No se ha seleccionado ningún archivo PDF.');
@@ -822,21 +922,33 @@ export async function extractRawTextFromPdfFile(file) {
   const arrayBuffer = await file.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
 
-  // 1. Si el navegador tiene window.pdfjsLib disponible, usarlo primero
-  if (typeof window !== 'undefined' && window.pdfjsLib?.getDocument) {
+  // 1. Usar pdfjs-dist (reconstruyendo líneas reales por coordenada Y/X)
+  let pdfjsLib = typeof window !== 'undefined' ? window.pdfjsLib : null;
+  if (!pdfjsLib && typeof window === 'undefined') {
     try {
-      const pdfDoc = await window.pdfjsLib.getDocument({ data: bytes }).promise;
-      let fullText = '';
+      const nodePdfJsPath = 'pdfjs-dist/legacy/build/pdf.mjs';
+      pdfjsLib = await import(/* @vite-ignore */ nodePdfJsPath);
+    } catch {
+      pdfjsLib = null;
+    }
+  }
+
+  if (pdfjsLib?.getDocument) {
+    try {
+      const pdfDoc = await pdfjsLib.getDocument({ data: bytes.slice(), verbosity: 0 }).promise;
+      const pageTexts = [];
       for (let p = 1; p <= pdfDoc.numPages; p += 1) {
         const page = await pdfDoc.getPage(p);
         const textContent = await page.getTextContent();
-        fullText += `${textContent.items.map((item) => item.str).join(' ')}\n`;
+        const reconstructed = reconstructLinesFromPdfJsItems(textContent.items || []);
+        if (reconstructed) pageTexts.push(reconstructed);
       }
-      if (fullText.trim()) {
-        return fullText;
+      const combinedPdfJs = pageTexts.join('\n').trim();
+      if (combinedPdfJs) {
+        return combinedPdfJs;
       }
     } catch {
-      // Continuar con extractor nativo
+      // Continuar con extractor nativo de respaldo
     }
   }
 

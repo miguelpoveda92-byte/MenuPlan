@@ -157,6 +157,10 @@ export function inferDietGroup(item = {}) {
     return item.dietGroup;
   }
 
+  if (item.mealCategory === 'desayuno') {
+    return 'desayuno_integral';
+  }
+
   const text = [
     item.name || '',
     item.description || '',
@@ -174,9 +178,6 @@ export function inferDietGroup(item = {}) {
   if (/(pollo|pavo|conejo|pechuga|chicken|turkey)/.test(text)) {
     return 'carnes_blancas';
   }
-  if (item.mealCategory === 'desayuno') {
-    return 'desayuno_integral';
-  }
   return 'verduras';
 }
 
@@ -185,11 +186,16 @@ export function scaleIngredients(ingredients = [], baseServings = DEFAULT_SERVIN
   const safeTarget = Math.max(1, Number(targetServings) || DEFAULT_SERVINGS);
   const ratio = safeTarget / safeBase;
 
-  return ingredients.map((ing) => ({
-    ...ing,
-    id: generateId('ing'),
-    amount: Math.round((Number(ing.amount) || 0) * ratio * 100) / 100,
-  }));
+  return ingredients.map((ing) => {
+    const isFixedUnit = ing.unit === 'pizca' || ing.keepFixed;
+    return {
+      ...ing,
+      id: generateId('ing'),
+      amount: isFixedUnit
+        ? Number(ing.amount) || 1
+        : Math.round((Number(ing.amount) || 0) * ratio * 100) / 100,
+    };
+  });
 }
 
 export function createDishFromRecipe(recipe, servings = DEFAULT_SERVINGS) {
