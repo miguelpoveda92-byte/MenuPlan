@@ -25,8 +25,8 @@ import {
   DEFAULT_SERVINGS,
   INGREDIENT_CATEGORIES,
   UNITS,
-  formatAmount,
   generateId,
+  getShoppingItemAmountDisplay,
 } from '../data/initialData';
 import {
   DEFAULT_PARTNER_EMAIL,
@@ -884,17 +884,21 @@ export default function ShoppingListView({
                               >
                                 {item.name}
                               </span>
-                              {item.amount > 0 && (
-                                <span
-                                  className={`rounded-md px-2 py-0.5 text-xs font-bold transition ${
-                                    isChecked
-                                      ? 'bg-slate-100 text-slate-400 line-through'
-                                      : 'bg-emerald-50 text-emerald-700'
-                                  }`}
-                                >
-                                  {formatAmount(item.amount)} {item.unit}
-                                </span>
-                              )}
+                              {(() => {
+                                const qtyText = getShoppingItemAmountDisplay(item);
+                                if (!qtyText) return null;
+                                return (
+                                  <span
+                                    className={`rounded-md px-2 py-0.5 text-xs font-bold transition ${
+                                      isChecked
+                                        ? 'bg-slate-100 text-slate-400 line-through'
+                                        : 'bg-emerald-50 text-emerald-700'
+                                    }`}
+                                  >
+                                    {qtyText}
+                                  </span>
+                                );
+                              })()}
                             </div>
 
                             {showSources && item.sources?.length > 0 && (
@@ -971,11 +975,15 @@ export default function ShoppingListView({
                       <span className="text-sm font-semibold text-slate-700">
                         {item.name}
                       </span>
-                      {item.amount > 0 && (
-                        <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600">
-                          {formatAmount(item.amount)} {item.unit}
-                        </span>
-                      )}
+                      {(() => {
+                        const qtyText = getShoppingItemAmountDisplay(item);
+                        if (!qtyText) return null;
+                        return (
+                          <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600">
+                            {qtyText}
+                          </span>
+                        );
+                      })()}
                     </div>
                     <p className="mt-0.5 text-[11px] text-slate-400">
                       {item.category} · {item.sources.join(' · ')}

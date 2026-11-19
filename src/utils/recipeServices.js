@@ -4,6 +4,8 @@ import {
   inferDietGroup,
   scaleIngredients,
   formatAmount,
+  canonicalizeIngredientName,
+  getShoppingItemAmountDisplay,
 } from '../data/initialData.js';
 
 // ============================================================================
@@ -420,6 +422,509 @@ export async function searchInternetRecipes(query = '', dietGroupFilter = 'all')
 }
 
 // ============================================================================
+// 1B. EXTRACTOR AUTOMÁTICO DE RECETAS DESDE UN ENLACE WEB (URL)
+// ============================================================================
+
+function decodeHtmlEntities(str = '') {
+  return String(str)
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&aacute;/gi, 'á')
+    .replace(/&eacute;/gi, 'é')
+    .replace(/&iacute;/gi, 'í')
+    .replace(/&oacute;/gi, 'ó')
+    .replace(/&uacute;/gi, 'ú')
+    .replace(/&ntilde;/gi, 'ñ')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseIsoDurationToMinutes(iso = '') {
+  const str = String(iso || '').trim();
+  if (!str) return null;
+  if (/^\d+$/.test(str)) return Number(str);
+  const m = str.match(/P(?:\d+D)?T(?:(\d+)H)?(?:(\d+)M)?/i);
+  if (!m) {
+    const minsMatch = str.match(/(\d+)\s*(?:min|m\b)/i);
+    return minsMatch ? Number(minsMatch[1]) : null;
+  }
+  const hours = Number(m[1] || 0);
+  const mins = Number(m[2] || 0);
+  const total = hours * 60 + mins;
+  return total > 0 ? total : null;
+}
+
+function parseServingsCount(rawYield) {
+  const text = Array.isArray(rawYield) ? String(rawYield[0] || '') : String(rawYield || '');
+  const m = text.match(/(\d+)/);
+  if (!m) return DEFAULT_SERVINGS;
+  const val = Number(m[1]);
+  return val >= 1 && val <= 30 ? val : DEFAULT_SERVINGS;
+}
+
+function flattenJsonLdInstructions(inst) {
+  if (!inst) return [];
+  if (typeof inst === 'string') {
+    return inst
+      .split(/\r?\n/)
+      .map((s) => decodeHtmlEntities(s.replace(/^\d+[.)]\s*/, '')))
+      .filter((s) => s.length > 4);
+  }
+  if (Array.isArray(inst)) {
+    return inst.flatMap(flattenJsonLdInstructions);
+  }
+  if (typeof inst === 'object') {
+    if (inst.itemListElement) return flattenJsonLdInstructions(inst.itemListElement);
+    if (inst.text) return flattenJsonLdInstructions(inst.text);
+    if (inst.name && !inst['@type']?.toLowerCase?.().includes('section')) {
+      return flattenJsonLdInstructions(inst.name);
+    }
+  }
+  return [];
+}
+
+function findRecipeNodeInJsonLd(node) {
+  if (!node) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findRecipeNodeInJsonLd(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof node === 'object') {
+    const rawType = node['@type'];
+    const types = Array.isArray(rawType) ? rawType : [rawType];
+    if (types.some((t) => typeof t === 'string' && /(?:^|:)recipe$/i.test(t.trim()))) {
+      return node;
+    }
+    if (node['@graph']) {
+      const foundGraph = findRecipeNodeInJsonLd(node['@graph']);
+      if (foundGraph) return foundGraph;
+    }
+    if (node.mainEntity) {
+      const foundMain = findRecipeNodeInJsonLd(node.mainEntity);
+      if (foundMain) return foundMain;
+    }
+  }
+  return null;
+}
+
+function detectMealCategoryFromText(text = '') {
+  const lower = String(text).toLowerCase();
+  if (/(desayuno|merienda|tostada|porridge|tortitas|gachas|breakfast|brunch|snack)/.test(lower)) {
+    return 'desayuno';
+  }
+  if (/(cena|crema de|sopa de|ensalada|tortilla|revuelto|hervido|dinner|supper)/.test(lower)) {
+    return 'cena';
+  }
+  return 'comida';
+}
+
+function extractImageUrl(imageField) {
+  if (!imageField) return '';
+  if (typeof imageField === 'string') return imageField;
+  if (Array.isArray(imageField)) return extractImageUrl(imageField[0]);
+  if (typeof imageField === 'object') return imageField.url || imageField.contentUrl || '';
+  return '';
+}
+
+function parseWebIngredientString(raw = '') {
+  // Normalizar fracciones unicode y rangos simples antes de pasar a parseIngredientLine
+  const normalized = decodeHtmlEntities(raw)
+    .replace(/½/g, '0.5')
+    .replace(/¼/g, '0.25')
+    .replace(/¾/g, '0.75')
+    .replace(/⅓/g, '0.33')
+    .replace(/⅔/g, '0.67')
+    .replace(/^[-•*▪]\s*/, '')
+    .trim();
+  if (!normalized) return null;
+
+  // Intentar formato inglés común cuando la web está en inglés o mixto ("200g chicken breast", "2 tbsp olive oil")
+  const enMatch = normalized.match(
+    /^(\d+(?:[.,]\d+)?(?:\s*\/\s*\d+)?)\s*(tbsp|tablespoons?|tsp|teaspoons?|cups?|cloves?|oz|ounces?|lb|lbs|pounds?|slices?)\b\s*(?:of\s+)?(.+)$/i,
+  );
+  if (enMatch) {
+    const rawNum = enMatch[1].replace(/\s+/g, '').replace(',', '.');
+    let amount = Number(rawNum) || 1;
+    if (rawNum.includes('/')) {
+      const [a, b] = rawNum.split('/').map(Number);
+      amount = b ? a / b : 1;
+    }
+    const u = enMatch[2].toLowerCase();
+    let unit = 'ud';
+    if (u.startsWith('tbsp') || u.startsWith('tablespoon')) unit = 'cda';
+    else if (u.startsWith('tsp') || u.startsWith('teaspoon')) unit = 'cdta';
+    else if (u.startsWith('cup')) unit = 'taza';
+    else if (u.startsWith('clove')) unit = 'diente';
+    else if (u.startsWith('slice')) unit = 'rebanada';
+    else if (u === 'oz' || u.startsWith('ounce')) {
+      amount = Math.round(amount * 28.35);
+      unit = 'g';
+    } else if (u.startsWith('lb') || u.startsWith('pound')) {
+      amount = Math.round(amount * 453.6);
+      unit = 'g';
+    }
+    const ingName = enMatch[3].replace(/\([^)]*\)$/, '').trim();
+    if (ingName) {
+      return {
+        id: generateId('ing'),
+        name: ingName.charAt(0).toUpperCase() + ingName.slice(1),
+        amount,
+        unit,
+        keepFixed: false,
+        category: categorizeIngredientName(ingName),
+      };
+    }
+  }
+
+  return parseIngredientLine(normalized);
+}
+
+export function extractRecipeFieldsFromHtml(html = '', url = '') {
+  let hostLabel = 'Web';
+  try {
+    hostLabel = new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    // ignore
+  }
+
+  // Estrategia 1: Schema.org JSON-LD (el estándar de casi todas las webs de recetas)
+  const ldMatches = html.matchAll(
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
+  );
+  for (const m of ldMatches) {
+    try {
+      const rawJson = m[1].trim().replace(/^\s*<!--/, '').replace(/-->\s*$/, '');
+      const parsed = JSON.parse(rawJson);
+      const recipeNode = findRecipeNodeInJsonLd(parsed);
+      if (recipeNode && recipeNode.name) {
+        const sourceServings = parseServingsCount(recipeNode.recipeYield);
+        const prepTime =
+          parseIsoDurationToMinutes(recipeNode.totalTime) ||
+          parseIsoDurationToMinutes(recipeNode.prepTime) ||
+          parseIsoDurationToMinutes(recipeNode.cookTime) ||
+          25;
+
+        const rawIngList = Array.isArray(recipeNode.recipeIngredient)
+          ? recipeNode.recipeIngredient
+          : Array.isArray(recipeNode.ingredients)
+            ? recipeNode.ingredients
+            : [];
+
+        const parsedIngs = rawIngList.map(parseWebIngredientString).filter(Boolean);
+        const scaledIngredients = scaleIngredients(parsedIngs, sourceServings, DEFAULT_SERVINGS);
+        const steps = flattenJsonLdInstructions(recipeNode.recipeInstructions);
+        const cleanTitle = decodeHtmlEntities(recipeNode.name);
+        const descText = decodeHtmlEntities(recipeNode.description || '').slice(0, 180);
+        const catHint = [
+          cleanTitle,
+          Array.isArray(recipeNode.recipeCategory)
+            ? recipeNode.recipeCategory.join(' ')
+            : recipeNode.recipeCategory || '',
+          Array.isArray(recipeNode.keywords) ? recipeNode.keywords.join(' ') : recipeNode.keywords || '',
+        ].join(' ');
+
+        const candidate = {
+          id: generateId('rec_url'),
+          name: cleanTitle,
+          mealCategory: detectMealCategoryFromText(catHint),
+          prepTime,
+          servings: DEFAULT_SERVINGS,
+          description:
+            descText ||
+            `Receta extraída de ${hostLabel}${
+              sourceServings !== DEFAULT_SERVINGS
+                ? ` · Reescalada de ${sourceServings} a ${DEFAULT_SERVINGS} personas`
+                : ' · Ajustada a 2 personas'
+            }.`,
+          sourceLabel: hostLabel,
+          sourceUrl: url,
+          imageUrl: extractImageUrl(recipeNode.image),
+          ingredients: scaledIngredients,
+          steps,
+        };
+
+        return {
+          recipe: { ...candidate, dietGroup: inferDietGroup(candidate) },
+          originalServings: sourceServings,
+          extractionMethod: 'JSON-LD (Schema.org)',
+        };
+      }
+    } catch {
+      // Continuar con el siguiente script JSON-LD o pasar a DOMParser
+    }
+  }
+
+  // Estrategia 2: DOMParser / selectores HTML semánticos
+  if (typeof DOMParser !== 'undefined') {
+    try {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const h1Title = doc.querySelector('h1')?.textContent?.trim();
+      const ogTitle = doc.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
+      const docTitle = doc.querySelector('title')?.textContent?.split('|')[0]?.split(' - ')[0]?.trim();
+      const title = decodeHtmlEntities(h1Title || ogTitle || docTitle || '');
+
+      const descMeta =
+        doc.querySelector('meta[name="description"]')?.getAttribute('content') ||
+        doc.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
+        '';
+
+      const ingSelectors = [
+        '[itemprop="recipeIngredient"]',
+        '[itemprop="ingredients"]',
+        '.ingredient',
+        '.ingredients li',
+        '[class*="ingred"] li',
+        '[class*="Ingred"] li',
+      ];
+      let ingNodes = [];
+      for (const sel of ingSelectors) {
+        const found = Array.from(doc.querySelectorAll(sel));
+        if (found.length >= 2) {
+          ingNodes = found;
+          break;
+        }
+      }
+
+      const stepSelectors = [
+        '[itemprop="recipeInstructions"] li',
+        '[itemprop="recipeInstructions"] p',
+        '.instructions li',
+        '.recipe-steps li',
+        '[class*="preparacion"] li',
+        '[class*="elaboracion"] li',
+        '[class*="pasos"] li',
+        '[class*="instruction"] p',
+      ];
+      let stepNodes = [];
+      for (const sel of stepSelectors) {
+        const found = Array.from(doc.querySelectorAll(sel));
+        if (found.length >= 1) {
+          stepNodes = found;
+          break;
+        }
+      }
+
+      const parsedIngs = ingNodes
+        .map((n) => parseWebIngredientString(n.textContent || ''))
+        .filter(Boolean);
+      const steps = stepNodes
+        .map((n) => decodeHtmlEntities((n.textContent || '').replace(/^\d+[.)]\s*/, '')))
+        .filter((s) => s.length > 6);
+
+      if (title && (parsedIngs.length >= 2 || steps.length >= 1)) {
+        const bodyText = doc.body?.textContent || '';
+        const servingsMatch = bodyText.match(/(\d+)\s*(?:personas?|raciones?|comensales?|porciones?)/i);
+        const sourceServings = servingsMatch ? parseServingsCount(servingsMatch[1]) : DEFAULT_SERVINGS;
+        const timeMatch = bodyText.match(/(\d+)\s*(?:min|minutos)\b/i);
+        const prepTime = timeMatch ? Math.max(5, Math.min(240, Number(timeMatch[1]))) : 25;
+
+        const scaledIngredients = scaleIngredients(parsedIngs, sourceServings, DEFAULT_SERVINGS);
+        const candidate = {
+          id: generateId('rec_url'),
+          name: title,
+          mealCategory: detectMealCategoryFromText(`${title} ${descMeta}`),
+          prepTime,
+          servings: DEFAULT_SERVINGS,
+          description: decodeHtmlEntities(descMeta).slice(0, 180) || `Receta extraída de ${hostLabel}.`,
+          sourceLabel: hostLabel,
+          sourceUrl: url,
+          imageUrl: doc.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
+          ingredients: scaledIngredients,
+          steps,
+        };
+
+        return {
+          recipe: { ...candidate, dietGroup: inferDietGroup(candidate) },
+          originalServings: sourceServings,
+          extractionMethod: 'HTML semántico',
+        };
+      }
+    } catch {
+      // Pasar a fallback de texto plano
+    }
+  }
+
+  return null;
+}
+
+export function extractRecipeFromMarkdownOrText(rawText = '', url = '') {
+  let hostLabel = 'Web';
+  try {
+    hostLabel = new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    // ignore
+  }
+
+  const lines = String(rawText || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  let title = '';
+  let sourceServings = DEFAULT_SERVINGS;
+  let prepTime = 25;
+  const rawIngLines = [];
+  const rawStepLines = [];
+  let section = 'none';
+
+  for (const line of lines) {
+    if (!title && /^#\s+(.+)$/.test(line)) {
+      title = line.replace(/^#\s+/, '').trim();
+      continue;
+    }
+    if (/^Title:\s*(.+)$/i.test(line) && !title) {
+      title = line.replace(/^Title:\s*/i, '').trim();
+      continue;
+    }
+
+    const servM = line.match(/(\d+)\s*(?:personas?|raciones?|comensales?|porciones?|servings?)/i);
+    if (servM && section === 'none') {
+      sourceServings = parseServingsCount(servM[1]);
+    }
+    const timeM = line.match(/(\d+)\s*(?:min|minutos)\b/i);
+    if (timeM && section === 'none' && prepTime === 25) {
+      prepTime = Math.max(5, Math.min(240, Number(timeM[1])));
+    }
+
+    const cleanHeading = line.replace(/^#+\s*/, '').replace(/[:*\s]+$/, '').toLowerCase();
+    if (/^(ingredientes|ingredients)$/.test(cleanHeading)) {
+      section = 'ingredients';
+      continue;
+    }
+    if (/^(preparaci[oó]n|elaboraci[oó]n|c[oó]mo hacer|instrucciones|pasos|instructions|method|steps)$/.test(cleanHeading)) {
+      section = 'steps';
+      continue;
+    }
+    if (/^#{1,3}\s+/.test(line) && section !== 'none') {
+      section = 'none';
+      continue;
+    }
+
+    if (section === 'ingredients' && /^[-*•\d]/.test(line)) {
+      const cleaned = line.replace(/^[-*•]\s*/, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim();
+      if (cleaned.length >= 2 && cleaned.length <= 120) rawIngLines.push(cleaned);
+    } else if (section === 'steps' && (line.length > 10 || /^\d+[.)]/.test(line))) {
+      const cleaned = line.replace(/^\d+[.)]\s*/, '').replace(/^[-*•]\s*/, '').trim();
+      if (cleaned.length > 8 && !/^https?:\/\//.test(cleaned)) rawStepLines.push(cleaned);
+    }
+  }
+
+  const parsedIngs = rawIngLines.map(parseWebIngredientString).filter(Boolean);
+  if (!title && parsedIngs.length === 0) return null;
+
+  const candidate = {
+    id: generateId('rec_url'),
+    name: title || `Receta de ${hostLabel}`,
+    mealCategory: detectMealCategoryFromText(title),
+    prepTime,
+    servings: DEFAULT_SERVINGS,
+    description: `Receta extraída de ${hostLabel} · Ajustada a 2 personas.`,
+    sourceLabel: hostLabel,
+    sourceUrl: url,
+    imageUrl: '',
+    ingredients: scaleIngredients(parsedIngs, sourceServings, DEFAULT_SERVINGS),
+    steps: rawStepLines.slice(0, 15),
+  };
+
+  return {
+    recipe: { ...candidate, dietGroup: inferDietGroup(candidate) },
+    originalServings: sourceServings,
+    extractionMethod: 'Texto estructurado web',
+  };
+}
+
+export async function extractRecipeFromUrl(rawUrl = '') {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) {
+    throw new Error('Pega el enlace (URL) de una receta de Internet.');
+  }
+  const normalizedUrl = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(normalizedUrl);
+  } catch {
+    throw new Error('El enlace introducido no tiene un formato de URL válido.');
+  }
+
+  const targetUrl = parsedUrl.toString();
+  const fetchWithTimeout = async (fetchUrl, headers = {}) => {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 12000) : null;
+    try {
+      const res = await fetch(fetchUrl, {
+        ...(controller ? { signal: controller.signal } : {}),
+        headers,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  const strategies = [
+    async () => {
+      const res = await fetchWithTimeout(
+        `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`,
+      );
+      const data = await res.json();
+      if (!data?.contents) throw new Error('Sin contenido HTML');
+      const extracted = extractRecipeFieldsFromHtml(data.contents, targetUrl);
+      if (extracted) return extracted;
+      throw new Error('No se encontraron campos de receta en HTML');
+    },
+    async () => {
+      const res = await fetchWithTimeout(
+        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+      );
+      const html = await res.text();
+      if (!html || html.length < 200) throw new Error('HTML vacío');
+      const extracted = extractRecipeFieldsFromHtml(html, targetUrl);
+      if (extracted) return extracted;
+      throw new Error('No se encontraron campos de receta en HTML');
+    },
+    async () => {
+      const res = await fetchWithTimeout(`https://r.jina.ai/${targetUrl}`, {
+        Accept: 'text/plain',
+      });
+      const md = await res.text();
+      const extracted = extractRecipeFromMarkdownOrText(md, targetUrl);
+      if (extracted && (extracted.recipe.ingredients.length > 0 || extracted.recipe.steps.length > 0)) {
+        return extracted;
+      }
+      throw new Error('No se pudo estructurar el contenido de la página');
+    },
+  ];
+
+  let lastError = null;
+  for (const runStrategy of strategies) {
+    try {
+      const result = await runStrategy();
+      if (result?.recipe?.name) {
+        return result;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    lastError?.message ||
+      'No se pudo leer automáticamente ese enlace (la web puede bloquear accesos externos). Prueba con otro enlace o copia y pega el texto en Importar PDF → Pegar texto.',
+  );
+}
+
+// ============================================================================
 // 2. LECTOR Y CONVERSOR DE PDF A RECETA (2 PERSONAS)
 // ============================================================================
 
@@ -431,11 +936,11 @@ async function decompressFlateBytes(bytes) {
   for (const format of ['deflate', 'deflate-raw']) {
     try {
       const ds = new DecompressionStream(format);
+      const bufferPromise = new Response(ds.readable).arrayBuffer();
       const writer = ds.writable.getWriter();
-      writer.write(bytes);
-      writer.close();
-      const response = new Response(ds.readable);
-      const buf = await response.arrayBuffer();
+      writer.write(bytes).catch(() => {});
+      writer.close().catch(() => {});
+      const buf = await bufferPromise;
       return new Uint8Array(buf);
     } catch {
       // Probar siguiente formato
@@ -615,93 +1120,126 @@ function decodeTjArray(arrayText, cidMap) {
   return out;
 }
 
-function extractTextOperatorsFromStream(content, cidMap = null) {
+function extractTextOperatorsFromStream(content, globalCidMap = null, fontRefs = null, fontCmaps = null) {
   const lines = [];
   let currentLine = '';
+  let currentY = null;
+  let currentX = 0;
+  let activeMap = globalCidMap;
+  let pendingBuffer = '';
 
-  const btBlocks = content.match(/BT[\s\S]*?ET/g) || [content];
-  for (const block of btBlocks) {
-    let currentY = null;
-    let currentX = 0;
-    const tokens =
-      block.match(
-        /\[(?:[^\[\]]|\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>)*\]\s*TJ|\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|(?:-?\d+(?:\.\d+)?\s+){5}-?\d+(?:\.\d+)?\s+Tm|-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+T[dD]|T\*|Tj|'|"/g,
-      ) || [];
-
-    let pendingBuffer = '';
-    for (const token of tokens) {
-      if (token.endsWith('TJ') && token.startsWith('[')) {
-        const inner = token.slice(1, token.lastIndexOf(']'));
-        currentLine += pendingBuffer + decodeTjArray(inner, cidMap);
-        pendingBuffer = '';
-      } else if (token.startsWith('(') && token.endsWith(')')) {
-        pendingBuffer += decodePdfLiteralString(token.slice(1, -1));
-      } else if (token.startsWith('<') && token.endsWith('>')) {
-        pendingBuffer += decodePdfHexWithCMap(token.slice(1, -1), cidMap);
-      } else if (token === 'Tj') {
-        currentLine += pendingBuffer;
-        pendingBuffer = '';
-      } else if (token === "'" || token === '"') {
-        if (currentLine.trim()) lines.push(currentLine.trim());
-        currentLine = pendingBuffer;
-        pendingBuffer = '';
-      } else if (token === 'T*') {
-        if (pendingBuffer) {
-          currentLine += pendingBuffer;
-          pendingBuffer = '';
-        }
-        if (currentLine.trim()) {
-          lines.push(currentLine.trim());
-          currentLine = '';
-        }
-      } else if (/\s+Tm$/.test(token)) {
-        const nums = token.trim().split(/\s+/);
-        const nextX = Number(nums[4]) || 0;
-        const nextY = Number(nums[5]) || 0;
-        if (pendingBuffer) {
-          currentLine += pendingBuffer;
-          pendingBuffer = '';
-        }
-        if (currentY !== null && Math.abs(nextY - currentY) > 2) {
-          if (currentLine.trim()) {
-            lines.push(currentLine.trim());
-            currentLine = '';
-          }
-        } else if (currentLine && !currentLine.endsWith(' ') && nextX > currentX + 2) {
-          currentLine += ' ';
-        }
-        currentX = nextX;
-        currentY = nextY;
-      } else if (/\s+T[dD]$/.test(token)) {
-        const parts = token.trim().split(/\s+/);
-        const dx = Number(parts[0]) || 0;
-        const dy = Number(parts[1]) || 0;
-        if (pendingBuffer) {
-          currentLine += pendingBuffer;
-          pendingBuffer = '';
-        }
-        if (Math.abs(dy) < 1) {
-          if (currentLine && !currentLine.endsWith(' ') && dx > 2) currentLine += ' ';
-        } else if (currentLine.trim()) {
-          lines.push(currentLine.trim());
-          currentLine = '';
-        }
-        currentX += dx;
-        if (currentY !== null) currentY += dy;
-      }
+  const pushLine = () => {
+    if (pendingBuffer) {
+      currentLine += pendingBuffer;
+      pendingBuffer = '';
     }
-    if (pendingBuffer) currentLine += pendingBuffer;
     if (currentLine.trim()) {
       lines.push(currentLine.trim());
-      currentLine = '';
+    }
+    currentLine = '';
+  };
+
+  const tokens =
+    content.match(
+      /\/[A-Za-z0-9_.-]+\s+\d+(?:\.\d+)?\s+Tf|\[(?:[^\[\]]|\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>)*\]\s*TJ|\((?:\\.|[^\\()])*\)|<[0-9a-fA-F\s]+>|(?:-?\d+(?:\.\d+)?\s+){5}-?\d+(?:\.\d+)?\s+Tm|-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+T[dD]|T\*|Tj|'|"/g,
+    ) || [];
+
+  for (const token of tokens) {
+    if (token.endsWith('Tf') && token.startsWith('/')) {
+      const fontName = token.slice(1).split(/\s+/)[0];
+      const fontObjId = fontRefs?.[fontName];
+      activeMap = (fontObjId && fontCmaps?.get(fontObjId)) || globalCidMap;
+    } else if (token.endsWith('TJ') && token.startsWith('[')) {
+      const inner = token.slice(1, token.lastIndexOf(']'));
+      currentLine += pendingBuffer + decodeTjArray(inner, activeMap);
+      pendingBuffer = '';
+    } else if (token.startsWith('(') && token.endsWith(')')) {
+      pendingBuffer += decodePdfLiteralString(token.slice(1, -1));
+    } else if (token.startsWith('<') && token.endsWith('>')) {
+      pendingBuffer += decodePdfHexWithCMap(token.slice(1, -1), activeMap);
+    } else if (token === 'Tj') {
+      currentLine += pendingBuffer;
+      pendingBuffer = '';
+    } else if (token === "'" || token === '"') {
+      if (currentLine.trim()) lines.push(currentLine.trim());
+      currentLine = pendingBuffer;
+      pendingBuffer = '';
+    } else if (token === 'T*') {
+      pushLine();
+    } else if (/\s+Tm$/.test(token)) {
+      const nums = token.trim().split(/\s+/);
+      const nextX = Number(nums[4]) || 0;
+      const nextY = Number(nums[5]) || 0;
+      if (pendingBuffer) {
+        currentLine += pendingBuffer;
+        pendingBuffer = '';
+      }
+      if (currentY !== null && Math.abs(nextY - currentY) > 2.5) {
+        pushLine();
+      } else if (currentLine && !currentLine.endsWith(' ') && nextX > currentX + 18) {
+        currentLine += ' ';
+      }
+      currentX = nextX;
+      currentY = nextY;
+    } else if (/\s+T[dD]$/.test(token)) {
+      const parts = token.trim().split(/\s+/);
+      const dx = Number(parts[0]) || 0;
+      const dy = Number(parts[1]) || 0;
+      if (pendingBuffer) {
+        currentLine += pendingBuffer;
+        pendingBuffer = '';
+      }
+      if (Math.abs(dy) > 1.5) {
+        pushLine();
+        if (currentY !== null) currentY += dy;
+      } else if (currentLine && !currentLine.endsWith(' ') && dx > 45) {
+        currentLine += ' ';
+      }
+      currentX += dx;
     }
   }
 
+  pushLine();
   return lines.join('\n');
 }
 
+function expandCompoundIngredientLine(rawLine) {
+  let clean = String(rawLine || '')
+    .replace(/^[-•*▪▫►]\s*/, '')
+    .replace(/^\d+[.)]\s*/, '')
+    .trim();
+  if (!clean) return [];
+
+  // Ignorar notas de elaboración auxiliar tipo "Para hummus casero: ..."
+  if (/^para\s+[^:]+:/i.test(clean)) {
+    return [];
+  }
+
+  // Limpiar sufijos generales entre paréntesis al final antes de dividir cantidades múltiples
+  clean = clean.replace(/\s*\([^)]*(?:rodajas?|de\s+cada|aprox)[^)]*\)\s*$/i, '').trim();
+
+  // Dividir líneas compuestas cuando cada parte empieza con cantidad + unidad ("40 g de pimiento verde y 40 g de pimiento rojo")
+  const splitParts = clean
+    .split(
+      /(?:\s*,\s*|\s+y\s+)(?=\s*\d+(?:[.,]\d+)?\s*(?:kg|g|gr|gramos|ml|l|litros?|ud|uds|unidades?|cda|cdas|cucharadas?|cdta|cdtas|cucharaditas?|dientes?|rebanadas?|tazas?)\b)/i,
+    )
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const finalParts = [];
+  for (const part of splitParts) {
+    // Limpiar coletilla "... y especias al gusto (...)" cuando precede un ingrediente medido
+    const cleanedPart = part
+      .replace(/\s+y\s+(?:especias|hierbas(?:\s+arom[aá]ticas)?)\s+al\s+gusto(?:\s*\([^)]*\))?\s*$/i, '')
+      .trim();
+    if (cleanedPart) finalParts.push(cleanedPart);
+  }
+
+  return finalParts;
+}
+
 function parseIngredientLine(line) {
-  let clean = line
+  let clean = String(line || '')
     .replace(/^[-•*▪▫►]\s*/, '')
     .replace(/^\d+[.)]\s*/, '')
     .trim();
@@ -763,22 +1301,34 @@ function parseIngredientLine(line) {
   };
 }
 
+function collapseSpacedLettersIfNeeded(line) {
+  if (/^(?:[A-Za-zÁÉÍÓÚáéíóúÑñ]\s+){3,}[A-Za-zÁÉÍÓÚáéíóúÑñ]/.test(line)) {
+    return line
+      .replace(/ {2,}/g, '§§')
+      .replace(/ (?=[A-Za-zÁÉÍÓÚáéíóúÑñ0-9,:.;!?()/-])/g, '')
+      .replace(/§§/g, ' ');
+  }
+  return line;
+}
+
 function preprocessPdfLines(rawText = '') {
   const rawLines = rawText
     .split(/\r?\n/)
-    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .map((l) => collapseSpacedLettersIfNeeded(l.replace(/\s+/g, ' ').trim()))
     .filter(Boolean);
 
   const cleaned = [];
-  const splitLabelRegex = /^(t[ií]tulo|receta|nombre|title|comida|categor[ií]a|tipo|tiempo|duraci[oó]n|prep|raciones|porciones|personas|comensales)\s*:\s*$/i;
+  const splitLabelRegex =
+    /^(t[ií]tulo|receta|nombre|title|comida|categor[ií]a|tipo|tiempo|duraci[oó]n|prep|raciones|porciones|personas|comensales)\s*:\s*$/i;
 
   for (let i = 0; i < rawLines.length; i += 1) {
-    // Descartar líneas de pie/cabecera de página tipo "... Page 1 of 1" o "Página 1 de 2"
+    // Descartar líneas de pie/cabecera de página tipo "Recetario Completo ... Page 1 of 27" o "Página 1 de 2"
     let line = rawLines[i].trim();
     if (
       !line ||
       /\b(?:page|p[áa]gina)\s+\d+\s+(?:of|de)\s+\d+\b/i.test(line) ||
-      /^(?:page|p[áa]gina)\s+\d+$/i.test(line)
+      /^(?:page|p[áa]gina)\s+\d+$/i.test(line) ||
+      /^recetario\s+completo\s*-\s*planes\s+diet[eé]ticos\b/i.test(line)
     ) {
       continue;
     }
@@ -843,10 +1393,12 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
       continue;
     }
 
-    const mealMeta = line.match(/(?:comida|categor[ií]a|tipo)\s*[:\-]?\s*(desayuno|comida|almuerzo|cena)/i);
+    const mealMeta = line.match(/(?:comida|categor[ií]a|tipo)\s*[:\-]?\s*(desayuno|merienda|comida|almuerzo|cena)/i);
     if (mealMeta) {
       const m = mealMeta[1].toLowerCase();
-      mealCategory = m === 'almuerzo' ? 'comida' : m;
+      if (m === 'almuerzo') mealCategory = 'comida';
+      else if (m === 'merienda') mealCategory = 'desayuno';
+      else mealCategory = m;
       continue;
     }
 
@@ -856,7 +1408,7 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
     }
 
     if (currentSection === 'header') {
-      if (!title && line.length >= 3 && line.length <= 90) {
+      if (!title && line.length >= 3 && line.length <= 120) {
         title = line;
       } else if (!description && line.length > 10) {
         description = line;
@@ -866,6 +1418,14 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
         currentSection = 'steps';
         const after = line.split(':').slice(1).join(':').trim();
         if (after) rawStepLines.push(after);
+      } else if (
+        !/^[-•*▪▫►]/.test(line) &&
+        !/^\d/.test(line) &&
+        rawIngredientLines.length > 0
+      ) {
+        // Línea envuelta continuación del ingrediente anterior
+        rawIngredientLines[rawIngredientLines.length - 1] =
+          `${rawIngredientLines[rawIngredientLines.length - 1]} ${line}`.trim();
       } else {
         rawIngredientLines.push(line);
       }
@@ -891,7 +1451,18 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
     }
   }
 
-  const parsedIngredients = rawIngredientLines
+  const noteExtras = [];
+  const expandedIngLines = [];
+  for (const rawIng of rawIngredientLines) {
+    const cleanRaw = rawIng.replace(/^[-•*▪▫►]\s*/, '').trim();
+    if (/^para\s+[^:]+:/i.test(cleanRaw)) {
+      noteExtras.push(cleanRaw);
+    } else {
+      expandedIngLines.push(...expandCompoundIngredientLine(rawIng));
+    }
+  }
+
+  const parsedIngredients = expandedIngLines
     .map(parseIngredientLine)
     .filter(Boolean);
 
@@ -911,6 +1482,7 @@ export function parseRecipeTextToStructured(rawText = '', fileName = 'Receta PDF
     servings: DEFAULT_SERVINGS,
     description:
       description ||
+      noteExtras.join(' · ') ||
       `Receta importada desde PDF (${fileName})${
         originalServings !== DEFAULT_SERVINGS
           ? ` · Cantidades ajustadas de ${originalServings} a 2 personas`
@@ -1019,6 +1591,160 @@ export function parseMultipleRecipesFromText(rawText = '', fileName = 'Receta PD
     .filter((entry) => entry.recipe && entry.recipe.name);
 }
 
+// ============================================================================
+// 2B. DETECCIÓN DE RECETAS REPETIDAS O PRÁCTICAMENTE IGUALES
+// ============================================================================
+
+const TITLE_STOPWORDS = new Set([
+  'de', 'del', 'con', 'sin', 'al', 'a', 'la', 'el', 'los', 'las', 'y', 'e', 'o',
+  'en', 'para', 'por', 'un', 'una', 'unos', 'unas', 'estilo', 'casero', 'casera',
+  'receta', 'express', 'expres', 'rapida', 'rapido', 'tradicional', 'gourmet',
+  'air', 'fryer', 'especias', 'natural',
+]);
+
+const MINOR_CONDIMENT_KEYS = new Set([
+  'sal', 'agua', 'aceite de oliva', 'pimienta', 'pimienta negra', 'pimienta blanca',
+  'ajo', 'ajo en polvo', 'cebolla en polvo', 'perejil', 'perejil fresco', 'oregano',
+  'tomillo', 'romero', 'comino', 'laurel', 'clavo', 'nuez moscada', 'vinagre',
+  'pimenton', 'pimenton dulce', 'hierbas provenzales', 'albahaca', 'curcuma',
+  'jengibre', 'cilantro', 'cilantro fresco', 'especias', 'sazonador',
+]);
+
+function stripAccentsLower(str = '') {
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+export function normalizeRecipeTitleForComparison(title = '') {
+  const cleaned = stripAccentsLower(title)
+    .replace(/\baove\b/g, 'aceite oliva')
+    .replace(/["'“”‘’().,:;!?/\\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const words = cleaned.split(' ').filter(Boolean);
+  const meaningful = words.filter((w) => w.length >= 2 && !TITLE_STOPWORDS.has(w));
+  return {
+    normalizedText: words.join(' '),
+    meaningfulText: meaningful.join(' '),
+    tokens: new Set(meaningful),
+  };
+}
+
+function getCoreIngredientSet(recipe) {
+  const full = new Set();
+  const core = new Set();
+  for (const ing of recipe?.ingredients || []) {
+    const { key } = canonicalizeIngredientName(ing.name || '');
+    if (!key) continue;
+    full.add(key);
+    const isMinor =
+      MINOR_CONDIMENT_KEYS.has(key) ||
+      /\b(especias|hierbas|sal |vinagre|ajo en polvo|pimienta)\b/.test(key);
+    if (!isMinor) {
+      core.add(key);
+    }
+  }
+  return core.size > 0 ? core : full;
+}
+
+function jaccardSimilarity(setA, setB) {
+  if (!setA.size || !setB.size) return 0;
+  let intersection = 0;
+  for (const item of setA) {
+    if (setB.has(item)) intersection += 1;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+export function computeRecipeSimilarity(recipeA, recipeB) {
+  if (!recipeA || !recipeB) return { isDuplicate: false, score: 0, reason: '' };
+
+  const tA = normalizeRecipeTitleForComparison(recipeA.name);
+  const tB = normalizeRecipeTitleForComparison(recipeB.name);
+
+  if (tA.normalizedText && tA.normalizedText === tB.normalizedText) {
+    return { isDuplicate: true, score: 1, reason: 'Mismo título' };
+  }
+
+  if (tA.meaningfulText && tA.meaningfulText === tB.meaningfulText) {
+    return { isDuplicate: true, score: 0.96, reason: 'Título prácticamente idéntico' };
+  }
+
+  const titleSim = jaccardSimilarity(tA.tokens, tB.tokens);
+  const coreA = getCoreIngredientSet(recipeA);
+  const coreB = getCoreIngredientSet(recipeB);
+  const ingSim = jaccardSimilarity(coreA, coreB);
+
+  const sameMeal =
+    !recipeA.mealCategory ||
+    !recipeB.mealCategory ||
+    recipeA.mealCategory === recipeB.mealCategory;
+
+  if (titleSim >= 0.72 && (coreA.size === 0 || coreB.size === 0 || ingSim >= 0.5)) {
+    return { isDuplicate: true, score: Math.max(titleSim, ingSim), reason: 'Título muy similar' };
+  }
+
+  if (ingSim >= 0.85 && sameMeal && titleSim >= 0.3) {
+    return { isDuplicate: true, score: ingSim, reason: 'Mismos ingredientes principales' };
+  }
+
+  if (titleSim >= 0.45 && ingSim >= 0.72) {
+    return {
+      isDuplicate: true,
+      score: Math.round(((titleSim + ingSim) / 2) * 100) / 100,
+      reason: 'Ingredientes y preparación equivalentes',
+    };
+  }
+
+  return { isDuplicate: false, score: Math.max(titleSim, ingSim), reason: '' };
+}
+
+export function findDuplicateOrSimilarRecipe(candidateRecipe, existingRecipes = []) {
+  let best = null;
+  for (const existing of existingRecipes) {
+    if (!existing || existing.id === candidateRecipe?.id) continue;
+    const sim = computeRecipeSimilarity(candidateRecipe, existing);
+    if (sim.isDuplicate && (!best || sim.score > best.score)) {
+      best = {
+        matchedRecipe: existing,
+        score: sim.score,
+        reason: sim.reason,
+      };
+    }
+  }
+  return best;
+}
+
+export function findDuplicateGroupsInRecipes(recipes = []) {
+  const duplicatePairs = [];
+  for (let i = 0; i < recipes.length; i += 1) {
+    for (let j = i + 1; j < recipes.length; j += 1) {
+      const sim = computeRecipeSimilarity(recipes[i], recipes[j]);
+      if (sim.isDuplicate) {
+        duplicatePairs.push({
+          keep: recipes[i],
+          duplicate: recipes[j],
+          score: sim.score,
+          reason: sim.reason,
+        });
+      }
+    }
+  }
+  return duplicatePairs;
+}
+
+async function decodeStreamBytesWithDict(streamBytes, dict) {
+  if (/\/FlateDecode/i.test(dict)) {
+    const inflated = await decompressFlateBytes(streamBytes);
+    return inflated ? bytesToLatin1(inflated) : '';
+  }
+  return bytesToLatin1(streamBytes);
+}
+
 export async function extractRawTextFromPdfFile(file) {
   if (!file) {
     throw new Error('No se ha seleccionado ningún archivo PDF.');
@@ -1026,62 +1752,167 @@ export async function extractRawTextFromPdfFile(file) {
 
   const arrayBuffer = await file.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
-
-  // Extractor PDF 100% compatible con navegadores móviles (ES2020, FlateDecode + ToUnicode CMap)
   const latin1 = bytesToLatin1(bytes);
-  const decodedStreams = [];
-  const cidMap = new Map();
-  const streamRegex = /<<([\s\S]*?)>>\s*stream\r?\n([\s\S]*?)endstream/g;
-  let match;
 
-  while ((match = streamRegex.exec(latin1)) !== null) {
-    const dict = match[1];
-    const streamStart = match.index + match[0].indexOf('stream');
-    const afterStreamKeyword = latin1.slice(streamStart, streamStart + 10);
-    const headerOffset = afterStreamKeyword.startsWith('stream\r\n') ? 8 : 7;
-    const rawStart = streamStart + headerOffset;
-    const rawEnd = match.index + match[0].length - 'endstream'.length;
+  // 1. Intentar lectura ordenada por árbol de páginas (/Catalog -> /Pages -> /Page) y fuentes por página
+  const objs = new Map();
+  const objRegex = /(\d+)\s+0\s+obj\b([\s\S]*?)endobj/g;
+  let objMatch;
+  while ((objMatch = objRegex.exec(latin1)) !== null) {
+    const objId = Number(objMatch[1]);
+    const bodyStart = objMatch.index + objMatch[0].indexOf(objMatch[2]);
+    objs.set(objId, { body: objMatch[2], bodyStart });
+  }
 
-    let streamBytes = bytes.subarray(rawStart, rawEnd);
-    if (streamBytes.length > 0 && (streamBytes[streamBytes.length - 1] === 10 || streamBytes[streamBytes.length - 1] === 13)) {
-      streamBytes = streamBytes.subarray(0, streamBytes.length - 1);
-    }
-
-    let decodedText = '';
-    if (/\/FlateDecode/i.test(dict)) {
-      const inflated = await decompressFlateBytes(streamBytes);
-      if (inflated) {
-        decodedText = bytesToLatin1(inflated);
+  const extractStreamSliceWithLength = (dict, startIdx, endIdx) => {
+    const lenMatch = dict.match(/\/Length\s+(\d+)\b/);
+    if (lenMatch) {
+      const declaredLen = Number(lenMatch[1]);
+      if (declaredLen > 0 && startIdx + declaredLen <= endIdx) {
+        return bytes.subarray(startIdx, startIdx + declaredLen);
       }
-    } else {
-      decodedText = bytesToLatin1(streamBytes);
     }
+    let slice = bytes.subarray(startIdx, endIdx);
+    if (slice.length >= 2 && slice[slice.length - 2] === 13 && slice[slice.length - 1] === 10) {
+      slice = slice.subarray(0, slice.length - 2);
+    } else if (slice.length >= 1 && (slice[slice.length - 1] === 10 || slice[slice.length - 1] === 13)) {
+      slice = slice.subarray(0, slice.length - 1);
+    }
+    return slice;
+  };
 
-    if (!decodedText) continue;
+  const decodeObjectStream = async (objId) => {
+    const entry = objs.get(objId);
+    if (!entry) return '';
+    const streamHeader = entry.body.match(/<<([\s\S]*?)>>\s*stream(?:\r\n|\n|\r)/);
+    if (!streamHeader) return '';
+    const dict = streamHeader[1];
+    const relStart = entry.body.indexOf(streamHeader[0]) + streamHeader[0].length;
+    const relEnd = entry.body.lastIndexOf('endstream');
+    if (relEnd <= relStart) return '';
+    const slice = extractStreamSliceWithLength(dict, entry.bodyStart + relStart, entry.bodyStart + relEnd);
+    return decodeStreamBytesWithDict(slice, dict);
+  };
 
-    if (
-      decodedText.includes('begincmap') ||
-      decodedText.includes('beginbfchar') ||
-      decodedText.includes('beginbfrange')
-    ) {
-      parseToUnicodeCMap(decodedText, cidMap);
-    } else if (decodedText.includes('Tj') || decodedText.includes('TJ') || decodedText.includes('BT')) {
-      decodedStreams.push(decodedText);
+  const globalCidMap = new Map();
+  const fontCmaps = new Map();
+
+  for (const [objId, entry] of objs.entries()) {
+    const toUniMatch = entry.body.match(/\/ToUnicode\s+(\d+)\s+0\s+R/);
+    if (toUniMatch) {
+      const cmapText = await decodeObjectStream(Number(toUniMatch[1]));
+      if (cmapText) {
+        const fontMap = new Map();
+        parseToUnicodeCMap(cmapText, fontMap);
+        parseToUnicodeCMap(cmapText, globalCidMap);
+        fontCmaps.set(objId, fontMap);
+      }
     }
   }
 
-  const extractedChunks = decodedStreams
-    .map((streamText) => extractTextOperatorsFromStream(streamText, cidMap))
-    .filter((chunk) => chunk && chunk.trim());
+  const orderedPageContents = [];
+  const resolveFontRefs = (pageBody) => {
+    const refs = {};
+    const fontDictMatch = pageBody.match(/\/Font\s*<<([\s\S]*?)>>/);
+    if (fontDictMatch) {
+      for (const rm of fontDictMatch[1].matchAll(/\/([A-Za-z0-9_.-]+)\s+(\d+)\s+0\s+R/g)) {
+        refs[rm[1]] = Number(rm[2]);
+      }
+    }
+    return refs;
+  };
 
-  if (extractedChunks.length === 0) {
-    const fallback = extractTextOperatorsFromStream(latin1, cidMap);
-    if (fallback.trim()) {
-      extractedChunks.push(fallback);
+  const collectPages = async (nodeId, inheritedFontRefs = {}) => {
+    const entry = objs.get(nodeId);
+    if (!entry) return;
+    const body = entry.body;
+    const nodeFontRefs = { ...inheritedFontRefs, ...resolveFontRefs(body) };
+
+    const kidsMatch = body.match(/\/Kids\s*\[([^\]]+)\]/);
+    if (kidsMatch && !/\/Contents\b/.test(body)) {
+      for (const km of kidsMatch[1].matchAll(/(\d+)\s+0\s+R/g)) {
+        await collectPages(Number(km[1]), nodeFontRefs);
+      }
+      return;
+    }
+
+    if (/\/Contents\b/.test(body)) {
+      const arrayMatch = body.match(/\/Contents\s*\[([^\]]+)\]/);
+      const singleMatch = body.match(/\/Contents\s+(\d+)\s+0\s+R/);
+      const contentIds = arrayMatch
+        ? Array.from(arrayMatch[1].matchAll(/(\d+)\s+0\s+R/g)).map((m) => Number(m[1]))
+        : singleMatch
+          ? [Number(singleMatch[1])]
+          : [];
+
+      const parts = [];
+      for (const cid of contentIds) {
+        const decoded = await decodeObjectStream(cid);
+        if (decoded && (decoded.includes('Tj') || decoded.includes('TJ') || decoded.includes('BT'))) {
+          parts.push(extractTextOperatorsFromStream(decoded, globalCidMap, nodeFontRefs, fontCmaps));
+        }
+      }
+      const joined = parts.filter(Boolean).join('\n');
+      if (joined.trim()) orderedPageContents.push(joined);
+    }
+  };
+
+  for (const [, entry] of objs.entries()) {
+    if (/\/Type\s*\/Catalog\b/.test(entry.body)) {
+      const pagesRef = entry.body.match(/\/Pages\s+(\d+)\s+0\s+R/);
+      if (pagesRef) {
+        await collectPages(Number(pagesRef[1]));
+      }
+      break;
     }
   }
 
-  const combinedText = extractedChunks.join('\n').trim();
+  let combinedText = orderedPageContents.join('\n').trim();
+
+  // 2. Fallback por escaneo directo de flujos (PDFs simples o sin /Catalog estándar)
+  if (!combinedText) {
+    const decodedStreams = [];
+    const streamRegex = /<<([\s\S]*?)>>\s*stream\r?\n([\s\S]*?)endstream/g;
+    let match;
+
+    while ((match = streamRegex.exec(latin1)) !== null) {
+      const dict = match[1];
+      const streamStart = match.index + match[0].indexOf('stream');
+      const afterStreamKeyword = latin1.slice(streamStart, streamStart + 10);
+      const headerOffset = afterStreamKeyword.startsWith('stream\r\n') ? 8 : 7;
+      const rawStart = streamStart + headerOffset;
+      const rawEnd = match.index + match[0].length - 'endstream'.length;
+
+      const streamBytes = extractStreamSliceWithLength(dict, rawStart, rawEnd);
+
+      const decodedText = await decodeStreamBytesWithDict(streamBytes, dict);
+      if (!decodedText) continue;
+
+      if (
+        decodedText.includes('begincmap') ||
+        decodedText.includes('beginbfchar') ||
+        decodedText.includes('beginbfrange')
+      ) {
+        parseToUnicodeCMap(decodedText, globalCidMap);
+      } else if (decodedText.includes('Tj') || decodedText.includes('TJ') || decodedText.includes('BT')) {
+        decodedStreams.push(decodedText);
+      }
+    }
+
+    const extractedChunks = decodedStreams
+      .map((streamText) => extractTextOperatorsFromStream(streamText, globalCidMap))
+      .filter((chunk) => chunk && chunk.trim());
+
+    if (extractedChunks.length === 0) {
+      const fallback = extractTextOperatorsFromStream(latin1, globalCidMap);
+      if (fallback.trim()) {
+        extractedChunks.push(fallback);
+      }
+    }
+
+    combinedText = extractedChunks.join('\n').trim();
+  }
+
   if (!combinedText) {
     throw new Error(
       `No se pudo extraer texto legible de "${file.name}" (puede ser una imagen escaneada).`,
@@ -1096,10 +1927,12 @@ export async function extractRecipeFromPdf(file) {
   return parseRecipeTextToStructured(combinedText, file.name);
 }
 
-export async function extractRecipesFromPdfFiles(files) {
+export async function extractRecipesFromPdfFiles(files, existingRecipes = []) {
   const fileList = Array.from(files || []).filter(Boolean);
   const items = [];
   const errors = [];
+  const existingSnapshot = Array.isArray(existingRecipes) ? [...existingRecipes] : [];
+  const seenBatchRecipes = [];
 
   for (const file of fileList) {
     try {
@@ -1108,7 +1941,23 @@ export async function extractRecipesFromPdfFiles(files) {
       if (parsedList.length === 0) {
         errors.push({ fileName: file.name, message: 'No se detectaron recetas válidas.' });
       } else {
-        items.push(...parsedList);
+        for (const entry of parsedList) {
+          const dupExisting = findDuplicateOrSimilarRecipe(entry.recipe, existingSnapshot);
+          const dupBatch = !dupExisting
+            ? findDuplicateOrSimilarRecipe(entry.recipe, seenBatchRecipes)
+            : null;
+          const dupMatch = dupExisting || dupBatch;
+
+          seenBatchRecipes.push(entry.recipe);
+
+          items.push({
+            ...entry,
+            isDuplicate: Boolean(dupMatch),
+            duplicateOf: dupMatch?.matchedRecipe?.name || '',
+            duplicateSource: dupExisting ? 'ya guardada en tu recetario' : dupBatch ? 'duplicada en este PDF' : '',
+            duplicateReason: dupMatch?.reason || '',
+          });
+        }
       }
     } catch (err) {
       errors.push({
@@ -1231,7 +2080,8 @@ export const GOOGLE_APPS_SCRIPT_TEMPLATE = `function doPost(e) {
   (data.groups || []).forEach(function(group) {
     body.appendParagraph(group.category).setHeading(DocumentApp.ParagraphHeading.HEADING2);
     group.items.forEach(function(item) {
-      var qty = item.amount > 0 ? ' — ' + item.amount + ' ' + item.unit : '';
+      var qtyStr = item.amountDisplay || (item.amount > 0 ? item.amount + ' ' + item.unit : '');
+      var qty = qtyStr ? ' — ' + qtyStr : '';
       body.appendListItem(item.name + qty).setGlyphType(DocumentApp.GlyphType.CHECKBOX);
     });
   });
@@ -1262,7 +2112,8 @@ export function buildChecklistText(groupedItems = [], servings = DEFAULT_SERVING
   for (const group of groupedItems) {
     lines.push(`[ ${group.category.label.toUpperCase()} ]`);
     for (const item of group.items) {
-      const qty = item.amount > 0 ? ` — ${formatAmount(item.amount)} ${item.unit}` : '';
+      const qtyText = getShoppingItemAmountDisplay(item);
+      const qty = qtyText ? ` — ${qtyText}` : '';
       lines.push(`☐ ${item.name}${qty}`);
     }
     lines.push('');
@@ -1288,10 +2139,10 @@ export function buildChecklistHtmlDoc(groupedItems = [], title = 'Lista de la Co
       <ul style="list-style:none;padding-left:0;margin:0;">
         ${group.items
           .map((item, idx) => {
-            const qty =
-              item.amount > 0
-                ? ` <span style="color:#475569;">— ${formatAmount(item.amount)} ${item.unit}</span>`
-                : '';
+            const qtyText = getShoppingItemAmountDisplay(item);
+            const qty = qtyText
+              ? ` <span style="color:#475569;">— ${qtyText}</span>`
+              : '';
             const checkId = `chk_${group.category.label.replace(/\W+/g, '')}_${idx}`;
             return `<li style="margin:6px 0;font-size:13px;line-height:1.4;"><label for="${checkId}" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;"><input id="${checkId}" type="checkbox" style="width:14px;height:14px;accent-color:#059669;" /><span><strong>${item.name}</strong>${qty}</span></label></li>`;
           })
@@ -1442,6 +2293,7 @@ export async function exportChecklistViaAppsScript({
         name: item.name,
         amount: item.amount,
         unit: item.unit,
+        amountDisplay: getShoppingItemAmountDisplay(item),
       })),
     })),
   };

@@ -170,7 +170,7 @@ export function inferDietGroup(item = {}) {
     .join(' ')
     .toLowerCase();
 
-  if (/(lenteja|garbanzo|alubia|jud[ií]a|habichuela|fabada|hummus|soja|edamame|lentil|chickpea|bean)/.test(text)) {
+  if (/(lenteja|garbanzo|alubia|jud[ií]as?\s+(?:blancas?|pintas?|rojas?|negras?|secas?)|habichuela|fabada|hummus|soja|edamame|lentil|chickpea|bean)/.test(text)) {
     return 'legumbres';
   }
   if (/(salm[oó]n|salmon|merluza|bacalao|at[uú]n|tuna|dorada|lubina|trucha|sardina|pescado|fish|cod|hake|gamba|langostino|calamar|pulpo|mejill[oó]n)/.test(text)) {
@@ -233,8 +233,208 @@ export function normalizeIngredientKey(name = '', unit = '') {
   return `${cleanName}::${cleanUnit}`;
 }
 
+function stripDiacritics(str = '') {
+  return String(str)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+const CANONICAL_INGREDIENT_MAP = new Map([
+  ['aove', 'Aceite de oliva'],
+  ['aceite de oliva', 'Aceite de oliva'],
+  ['aceite de oliva virgen', 'Aceite de oliva'],
+  ['aceite de oliva virgen extra', 'Aceite de oliva'],
+  ['aceite oliva', 'Aceite de oliva'],
+  ['aguacate', 'Aguacate'],
+  ['aguacates', 'Aguacate'],
+  ['ajo', 'Ajo'],
+  ['ajos', 'Ajo'],
+  ['diente de ajo', 'Ajo'],
+  ['dientes de ajo', 'Ajo'],
+  ['cebolla', 'Cebolla'],
+  ['cebollas', 'Cebolla'],
+  ['cebolla blanca', 'Cebolla'],
+  ['cebolla morada', 'Cebolla morada'],
+  ['cebolla o cebolleta', 'Cebolla'],
+  ['huevo', 'Huevo'],
+  ['huevos', 'Huevo'],
+  ['huevo de gallina', 'Huevo'],
+  ['clara de huevo', 'Clara de huevo'],
+  ['claras de huevo', 'Clara de huevo'],
+  ['patata', 'Patata'],
+  ['patatas', 'Patata'],
+  ['tomate', 'Tomate'],
+  ['tomates', 'Tomate'],
+  ['tomate crudo', 'Tomate'],
+  ['tomate maduro', 'Tomate'],
+  ['tomate de ensalada', 'Tomate'],
+  ['tomate natural', 'Tomate'],
+  ['tomate natural triturado', 'Tomate triturado'],
+  ['tomate triturado', 'Tomate triturado'],
+  ['tomate triturado natural', 'Tomate triturado'],
+  ['tomate cherry', 'Tomates cherry'],
+  ['tomates cherry', 'Tomates cherry'],
+  ['pimiento rojo', 'Pimiento rojo'],
+  ['pimientos rojos', 'Pimiento rojo'],
+  ['pimiento verde', 'Pimiento verde'],
+  ['pimientos verdes', 'Pimiento verde'],
+  ['zanahoria', 'Zanahoria'],
+  ['zanahorias', 'Zanahoria'],
+  ['calabacin', 'Calabacín'],
+  ['calabacines', 'Calabacín'],
+  ['platano', 'Plátano'],
+  ['platanos', 'Plátano'],
+  ['limon', 'Limón'],
+  ['limones', 'Limón'],
+  ['zumo de limon', 'Zumo de limón'],
+  ['sal', 'Sal'],
+  ['sal comun', 'Sal'],
+  ['sal yodada', 'Sal'],
+  ['sal marina', 'Sal'],
+  ['sal fina', 'Sal'],
+  ['pimienta', 'Pimienta'],
+  ['pimienta negra', 'Pimienta negra'],
+  ['perejil', 'Perejil fresco'],
+  ['perejil fresco', 'Perejil fresco'],
+  ['oregano', 'Orégano'],
+  ['atun al natural', 'Atún al natural'],
+  ['atun al natural en conserva', 'Atún al natural'],
+  ['lomos de merluza', 'Merluza'],
+  ['merluza', 'Merluza'],
+  ['lomos de salmon', 'Salmón'],
+  ['salmon', 'Salmón'],
+  ['lomos de bacalao', 'Bacalao'],
+  ['lomos de bacalao fresco', 'Bacalao'],
+  ['lomos de bacalao desalado', 'Bacalao desalado'],
+  ['lomos de dorada', 'Dorada'],
+  ['dorada', 'Dorada'],
+]);
+
+export function canonicalizeIngredientName(rawName = '') {
+  let clean = String(rawName || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\b(?:al gusto|aprox\.?)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[,.;:\-\s]+|[,.;:\-\s]+$/g, '')
+    .trim();
+
+  if (!clean) return { key: '', displayName: '' };
+
+  const asciiLower = stripDiacritics(clean).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (CANONICAL_INGREDIENT_MAP.has(asciiLower)) {
+    const mapped = CANONICAL_INGREDIENT_MAP.get(asciiLower);
+    return {
+      key: stripDiacritics(mapped).toLowerCase(),
+      displayName: mapped,
+    };
+  }
+
+  // Normalizar plural simple terminado en "-s" si no termina en "s" originalmente (p.ej. pepinos -> pepino, kiwis -> kiwi)
+  let displayName = clean.charAt(0).toUpperCase() + clean.slice(1);
+  let key = asciiLower;
+
+  if (asciiLower.length > 4 && asciiLower.endsWith('es') && !/(?:ques|cues|ces|tes|nes)$/.test(asciiLower)) {
+    const singularTry = asciiLower.slice(0, -2);
+    if (CANONICAL_INGREDIENT_MAP.has(singularTry)) {
+      const mapped = CANONICAL_INGREDIENT_MAP.get(singularTry);
+      return { key: stripDiacritics(mapped).toLowerCase(), displayName: mapped };
+    }
+  } else if (asciiLower.length > 4 && asciiLower.endsWith('s') && !asciiLower.endsWith('ss') && !/(?:es|us|is|os)$/.test(asciiLower)) {
+    key = asciiLower.slice(0, -1);
+    const trimmedOrig = clean.slice(0, -1);
+    displayName = trimmedOrig.charAt(0).toUpperCase() + trimmedOrig.slice(1);
+  }
+
+  return { key, displayName };
+}
+
+function normalizeUnitForAggregation(rawUnit = '', rawAmount = 0) {
+  const unitLower = String(rawUnit || 'ud').trim().toLowerCase();
+  const amount = Number(rawAmount) || 0;
+
+  if (unitLower === 'kg') return { unit: 'g', amount: Math.round(amount * 1000 * 100) / 100 };
+  if (unitLower === 'l' || unitLower === 'litro' || unitLower === 'litros') {
+    return { unit: 'ml', amount: Math.round(amount * 1000 * 100) / 100 };
+  }
+  if (/^(uds?|unidades?)$/.test(unitLower)) return { unit: 'ud', amount };
+  if (!unitLower) return { unit: 'ud', amount };
+  return { unit: unitLower, amount };
+}
+
+const UNIT_SORT_ORDER = ['ud', 'lata', 'rebanada', 'diente', 'manojo', 'taza', 'cda', 'cdta', 'g', 'ml', 'pizca'];
+
+export function formatCombinedQuantities(quantitiesByUnit = {}) {
+  const entries = Object.entries(quantitiesByUnit).filter(([, val]) => Number(val) > 0);
+  if (entries.length === 0) return '';
+
+  // Si hay unidades medidas (g, ml, ud, cda...), omitir "pizca" redundante al fusionar el mismo ingrediente
+  const hasMeasured = entries.some(([u]) => u !== 'pizca');
+  const filtered = hasMeasured ? entries.filter(([u]) => u !== 'pizca') : entries;
+
+  filtered.sort(([uA], [uB]) => {
+    const iA = UNIT_SORT_ORDER.indexOf(uA);
+    const iB = UNIT_SORT_ORDER.indexOf(uB);
+    return (iA === -1 ? 99 : iA) - (iB === -1 ? 99 : iB);
+  });
+
+  return filtered
+    .map(([unit, rawVal]) => {
+      if (unit === 'pizca' && filtered.length === 1) return 'al gusto';
+      if (unit === 'g' && rawVal >= 1000 && rawVal % 100 === 0) {
+        return `${formatAmount(rawVal / 1000)} kg`;
+      }
+      if (unit === 'ml' && rawVal >= 1000 && rawVal % 100 === 0) {
+        return `${formatAmount(rawVal / 1000)} l`;
+      }
+      return `${formatAmount(rawVal)} ${unit}`;
+    })
+    .join(' + ');
+}
+
+export function getShoppingItemAmountDisplay(item) {
+  if (!item) return '';
+  if (item.amountDisplay) return item.amountDisplay;
+  if (item.quantities) return formatCombinedQuantities(item.quantities);
+  if (item.amount > 0) return `${formatAmount(item.amount)} ${item.unit || 'ud'}`.trim();
+  return '';
+}
+
 export function buildShoppingList(weeklyMenu, extraItems = []) {
   const aggregated = new Map();
+
+  const mergeEntry = ({ name, amount, unit, category, sourceLabel, manualId = null }) => {
+    const { key, displayName } = canonicalizeIngredientName(name);
+    if (!key) return;
+
+    const norm = normalizeUnitForAggregation(unit, amount);
+    if (norm.amount <= 0) return;
+
+    if (aggregated.has(key)) {
+      const current = aggregated.get(key);
+      current.quantities[norm.unit] =
+        Math.round(((current.quantities[norm.unit] || 0) + norm.amount) * 100) / 100;
+      if (sourceLabel && !current.sources.includes(sourceLabel)) {
+        current.sources.push(sourceLabel);
+      }
+      if (manualId) {
+        current.manualIds.push(manualId);
+      }
+      current.isManual = current.isManual && Boolean(manualId);
+    } else {
+      aggregated.set(key, {
+        id: `ing::${key}`,
+        manualId: manualId || null,
+        manualIds: manualId ? [manualId] : [],
+        name: displayName,
+        quantities: { [norm.unit]: norm.amount },
+        amount: norm.amount,
+        unit: norm.unit,
+        category: category || 'Condimentos y Otros',
+        sources: sourceLabel ? [sourceLabel] : [],
+        isManual: Boolean(manualId),
+      });
+    }
+  };
 
   for (const day of DAYS) {
     const dayMeals = weeklyMenu?.[day.id];
@@ -247,30 +447,13 @@ export function buildShoppingList(weeklyMenu, extraItems = []) {
         for (const ing of ingredients) {
           const cleanName = (ing.name || '').trim();
           if (!cleanName) continue;
-
-          const unit = (ing.unit || 'ud').trim();
-          const key = normalizeIngredientKey(cleanName, unit);
-          const amount = Number(ing.amount) || 0;
-          const category = ing.category || 'Condimentos y Otros';
-          const sourceLabel = `${day.shortLabel} (${meal.label}): ${dish.name}`;
-
-          if (aggregated.has(key)) {
-            const current = aggregated.get(key);
-            current.amount = Math.round((current.amount + amount) * 100) / 100;
-            if (!current.sources.includes(sourceLabel)) {
-              current.sources.push(sourceLabel);
-            }
-          } else {
-            aggregated.set(key, {
-              id: key,
-              name: cleanName.charAt(0).toUpperCase() + cleanName.slice(1),
-              amount,
-              unit,
-              category,
-              sources: [sourceLabel],
-              isManual: false,
-            });
-          }
+          mergeEntry({
+            name: cleanName,
+            amount: Number(ing.amount) || 0,
+            unit: (ing.unit || 'ud').trim(),
+            category: ing.category || 'Condimentos y Otros',
+            sourceLabel: `${day.shortLabel} (${meal.label}): ${dish.name}`,
+          });
         }
       }
     }
@@ -279,21 +462,29 @@ export function buildShoppingList(weeklyMenu, extraItems = []) {
   for (const extra of extraItems) {
     const cleanName = (extra.name || '').trim();
     if (!cleanName) continue;
-    const unit = (extra.unit || 'ud').trim();
-    const key = `manual::${extra.id}`;
-    aggregated.set(key, {
-      id: key,
-      manualId: extra.id,
-      name: cleanName.charAt(0).toUpperCase() + cleanName.slice(1),
+    mergeEntry({
+      name: cleanName,
       amount: Number(extra.amount) || 1,
-      unit,
+      unit: (extra.unit || 'ud').trim(),
       category: extra.category || 'Condimentos y Otros',
-      sources: ['Añadido manualmente'],
-      isManual: true,
+      sourceLabel: 'Añadido manualmente',
+      manualId: extra.id,
     });
   }
 
-  return Array.from(aggregated.values()).sort((a, b) => a.name.localeCompare(b.name, 'es'));
+  return Array.from(aggregated.values())
+    .map((entry) => {
+      const amountDisplay = formatCombinedQuantities(entry.quantities);
+      const unitEntries = Object.entries(entry.quantities);
+      const [primaryUnit, primaryAmount] = unitEntries[0] || [entry.unit, entry.amount];
+      return {
+        ...entry,
+        amount: primaryAmount,
+        unit: primaryUnit,
+        amountDisplay,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name, 'es'));
 }
 
 export const INITIAL_RECIPES = [

@@ -18,6 +18,8 @@ import {
   Sparkles,
   FileText,
   ExternalLink,
+  Link2,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   DAYS,
@@ -31,13 +33,16 @@ import {
 } from '../data/initialData';
 import {
   searchInternetRecipes,
+  extractRecipeFromUrl,
   extractRecipesFromPdfFiles,
   parseMultipleRecipesFromText,
+  findDuplicateOrSimilarRecipe,
+  findDuplicateGroupsInRecipes,
   generateSampleRecipePdfBlob,
 } from '../utils/recipeServices';
 import { IngredientListEditor } from './DishModal';
 
-function RecipeFormModal({ isOpen, onClose, recipeToEdit, onSave }) {
+function RecipeFormModal({ isOpen, onClose, recipeToEdit, existingRecipes = [], onSave }) {
   const isEditing = Boolean(recipeToEdit);
   const [name, setName] = useState(recipeToEdit?.name || '');
   const [mealCategory, setMealCategory] = useState(recipeToEdit?.mealCategory || 'comida');
@@ -51,6 +56,14 @@ function RecipeFormModal({ isOpen, onClose, recipeToEdit, onSave }) {
     recipeToEdit?.ingredients ? recipeToEdit.ingredients.map((i) => ({ ...i })) : [],
   );
   const [stepsText, setStepsText] = useState((recipeToEdit?.steps || []).join('\n'));
+
+  const possibleDuplicate = useMemo(() => {
+    if (!name.trim() || name.trim().length < 3) return null;
+    return findDuplicateOrSimilarRecipe(
+      { id: recipeToEdit?.id || 'draft', name, mealCategory, ingredients },
+      existingRecipes,
+    );
+  }, [name, mealCategory, ingredients, recipeToEdit?.id, existingRecipes]);
 
   if (!isOpen) return null;
 
@@ -112,6 +125,16 @@ function RecipeFormModal({ isOpen, onClose, recipeToEdit, onSave }) {
         </div>
 
         <form id="recipe-form" onSubmit={handleSubmit} className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          {possibleDuplicate && (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <span>
+                Ya existe una receta muy similar en tu recetario:{' '}
+                <strong>&laquo;{possibleDuplicate.matchedRecipe.name}&raquo;</strong> ({possibleDuplicate.reason}).
+              </span>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
             <div className="sm:col-span-6">
               <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
@@ -246,6 +269,11 @@ function RecipeFormModal({ isOpen, onClose, recipeToEdit, onSave }) {
 }
 
 function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) {
+  const [urlInput, setUrlInput] = useState('');
+  const [urlLoading, setUrlLoading] = useState(false);
+  const [urlError, setUrlError] = useState('');
+  const [urlDraft, setUrlDraft] = useState(null);
+
   const [query, setQuery] = useState('');
   const [dietFilter, setDietFilter] = useState('all');
   const [loading, setLoading] = useState(false);
@@ -265,13 +293,67 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
   };
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setUrlInput('');
+      setUrlError('');
+      setUrlDraft(null);
+      return;
+    }
     runSearch('', 'all');
   }, [isOpen]);
 
+  const urlDuplicateMatch = useMemo(() => {
+    if (!urlDraft?.name?.trim()) return null;
+    return findDuplicateOrSimilarRecipe(urlDraft, existingRecipes);
+  }, [urlDraft, existingRecipes]);
+
   if (!isOpen) return null;
 
-  const existingNames = new Set(existingRecipes.map((r) => r.name.trim().toLowerCase()));
+  const handleExtractFromUrl = async (e) => {
+    e.preventDefault();
+    if (!urlInput.trim()) return;
+    setUrlError('');
+    setUrlLoading(true);
+    try {
+      const extracted = await extractRecipeFromUrl(urlInput);
+      const r = extracted.recipe;
+      setUrlDraft({
+        ...r,
+        originalServings: extracted.originalServings,
+        extractionMethod: extracted.extractionMethod,
+        stepsText: (r.steps || []).join('\n'),
+      });
+    } catch (err) {
+      setUrlError(err.message || 'No se pudo extraer la receta de ese enlace.');
+    } finally {
+      setUrlLoading(false);
+    }
+  };
+
+  const handleSaveUrlDraft = (e) => {
+    e.preventDefault();
+    if (!urlDraft?.name?.trim()) return;
+    const cleanRecipe = {
+      id: generateId('rec_url'),
+      name: urlDraft.name.trim(),
+      mealCategory: urlDraft.mealCategory || 'comida',
+      dietGroup: urlDraft.dietGroup || inferDietGroup(urlDraft),
+      prepTime: Math.max(1, Number(urlDraft.prepTime) || 25),
+      servings: DEFAULT_SERVINGS,
+      description: (urlDraft.description || '').trim(),
+      sourceLabel: urlDraft.sourceLabel,
+      sourceUrl: urlDraft.sourceUrl,
+      imageUrl: urlDraft.imageUrl || '',
+      ingredients: (urlDraft.ingredients || []).filter((i) => i.name.trim()),
+      steps: (urlDraft.stepsText || '')
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    };
+    onAddRecipe(cleanRecipe);
+    setUrlDraft(null);
+    setUrlInput('');
+  };
 
   const handleSearchSubmit = (e) => {
     e.preventDefault();
@@ -308,11 +390,11 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
             <div className="flex items-center gap-2">
               <Globe className="h-5 w-5 text-sky-600" />
               <h2 id="internet-modal-title" className="text-lg font-bold text-slate-900">
-                Buscar recetas en Internet
+                Recetas de Internet y Enlaces Web
               </h2>
             </div>
             <p className="mt-0.5 text-xs text-slate-500">
-              Todas las recetas encontradas se ajustan automáticamente para 2 personas antes de añadirse a tu lista.
+              Pega el enlace de cualquier receta online para extraer sus campos automáticamente (ajustada a 2 personas), o busca en el catálogo.
             </p>
           </div>
           <button
@@ -326,64 +408,224 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
         </div>
 
         <div className="space-y-3 border-b border-slate-100 bg-slate-50/70 px-5 py-3.5">
-          <form onSubmit={handleSearchSubmit} className="flex gap-2">
-            <div className="relative flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          {/* Bloque de importación automática desde enlace (URL) */}
+          <form onSubmit={handleExtractFromUrl} className="rounded-xl border border-sky-200 bg-sky-50/80 p-3">
+            <label className="mb-1.5 flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-wider text-sky-900">
+              <Link2 className="h-3.5 w-3.5 text-sky-600" />
+              Pegar enlace (URL) de una receta web
+            </label>
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Ej. pollo, salmón, lentejas, garbanzos, verduras..."
-                className="w-full rounded-xl border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-800 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20"
+                type="url"
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                placeholder="https://www.ejemplo.com/receta-garbanzos-espinacas"
+                className="flex-1 rounded-xl border border-sky-200 bg-white px-3 py-2 text-xs text-slate-800 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20 sm:text-sm"
               />
+              <button
+                type="submit"
+                disabled={urlLoading || !urlInput.trim()}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-sky-600 px-4 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-sky-700 disabled:opacity-50"
+              >
+                {urlLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                {urlLoading ? 'Leyendo enlace...' : 'Extraer receta'}
+              </button>
             </div>
-            <button
-              type="submit"
-              disabled={loading}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-sky-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-sky-700 disabled:opacity-60 sm:text-sm"
-            >
-              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-              Buscar
-            </button>
+            {urlError && (
+              <p className="mt-2 text-xs font-medium text-rose-700">{urlError}</p>
+            )}
           </form>
 
-          <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
-            <button
-              type="button"
-              onClick={() => handleFilterClick('all')}
-              className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold transition ${
-                dietFilter === 'all'
-                  ? 'bg-slate-900 text-white'
-                  : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
-              }`}
-            >
-              Todos los grupos
-            </button>
-            {mainGroups.map((g) => (
-              <button
-                key={g.id}
-                type="button"
-                onClick={() => handleFilterClick(g.id)}
-                className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold transition ${
-                  dietFilter === g.id
-                    ? 'bg-emerald-600 text-white'
-                    : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                {g.label}
-              </button>
-            ))}
-          </div>
+          {!urlDraft && (
+            <>
+              <form onSubmit={handleSearchSubmit} className="flex gap-2">
+                <div className="relative flex-1">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="O buscar en catálogo: pollo, salmón, lentejas, verduras..."
+                    className="w-full rounded-xl border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-800 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-800 px-4 py-2 text-xs font-bold text-white transition hover:bg-slate-700 disabled:opacity-60 sm:text-sm"
+                >
+                  {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                  Buscar
+                </button>
+              </form>
 
-          {!apiReachable && (
-            <p className="text-[11px] font-medium text-amber-700">
-              Mostrando resultados del catálogo mediterráneo online (sin conexión con TheMealDB en este momento).
-            </p>
+              <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
+                <button
+                  type="button"
+                  onClick={() => handleFilterClick('all')}
+                  className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold transition ${
+                    dietFilter === 'all'
+                      ? 'bg-slate-900 text-white'
+                      : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  Todos los grupos
+                </button>
+                {mainGroups.map((g) => (
+                  <button
+                    key={g.id}
+                    type="button"
+                    onClick={() => handleFilterClick(g.id)}
+                    className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold transition ${
+                      dietFilter === g.id
+                        ? 'bg-emerald-600 text-white'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    {g.label}
+                  </button>
+                ))}
+              </div>
+
+              {!apiReachable && (
+                <p className="text-[11px] font-medium text-amber-700">
+                  Mostrando resultados del catálogo mediterráneo online (sin conexión con TheMealDB en este momento).
+                </p>
+              )}
+            </>
           )}
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4">
-          {loading ? (
+          {urlDraft ? (
+            <form onSubmit={handleSaveUrlDraft} className="space-y-4 rounded-2xl border border-emerald-200 bg-emerald-50/30 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-100 pb-3">
+                <div>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-bold text-emerald-800">
+                    <Sparkles className="h-3 w-3" />
+                    Extraída automáticamente ({urlDraft.extractionMethod})
+                    {urlDraft.originalServings && urlDraft.originalServings !== DEFAULT_SERVINGS
+                      ? ` · Escalada de ${urlDraft.originalServings} a 2 pers.`
+                      : ' · 2 pers.'}
+                  </span>
+                  <h3 className="mt-1 text-sm font-bold text-slate-900">
+                    Revisa o ajusta los campos detectados antes de guardar
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setUrlDraft(null)}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Volver al buscador
+                </button>
+              </div>
+
+              {urlDuplicateMatch && (
+                <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                  <span>
+                    Aviso: esta receta parece repetida o muy similar a{' '}
+                    <strong>&laquo;{urlDuplicateMatch.matchedRecipe.name}&raquo;</strong> ({urlDuplicateMatch.reason}).
+                  </span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
+                <div className="sm:col-span-6">
+                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                    Nombre *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={urlDraft.name}
+                    onChange={(e) => setUrlDraft((d) => ({ ...d, name: e.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 focus:border-emerald-500 focus:outline-none"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                    Comida
+                  </label>
+                  <select
+                    value={urlDraft.mealCategory}
+                    onChange={(e) => setUrlDraft((d) => ({ ...d, mealCategory: e.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-2 py-2 text-sm font-medium text-slate-800"
+                  >
+                    {MEAL_TYPES.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                    Grupo
+                  </label>
+                  <select
+                    value={urlDraft.dietGroup}
+                    onChange={(e) => setUrlDraft((d) => ({ ...d, dietGroup: e.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-2 py-2 text-sm font-medium text-slate-800"
+                  >
+                    {DIET_GROUPS.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                    Minutos
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={urlDraft.prepTime}
+                    onChange={(e) => setUrlDraft((d) => ({ ...d, prepTime: e.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm font-semibold text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <IngredientListEditor
+                ingredients={urlDraft.ingredients || []}
+                onChange={(nextIngs) => setUrlDraft((d) => ({ ...d, ingredients: nextIngs }))}
+                emptyHint="No se detectaron ingredientes estructurados en el enlace; añádelos aquí."
+              />
+
+              <div>
+                <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-600">
+                  Pasos de preparación (uno por línea)
+                </label>
+                <textarea
+                  rows="4"
+                  value={urlDraft.stepsText}
+                  onChange={(e) => setUrlDraft((d) => ({ ...d, stepsText: e.target.value }))}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:border-emerald-500 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setUrlDraft(null)}
+                  className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Descartar
+                </button>
+                <button
+                  type="submit"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-5 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 sm:text-sm"
+                >
+                  <Check className="h-4 w-4" />
+                  Guardar en mi recetario (2 pers.)
+                </button>
+              </div>
+            </form>
+          ) : loading ? (
             <div className="flex flex-col items-center justify-center py-12 text-slate-500">
               <Loader2 className="h-8 w-8 animate-spin text-sky-600" />
               <p className="mt-2 text-sm font-medium">Buscando recetas en Internet...</p>
@@ -394,14 +636,14 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
                 No se encontraron recetas para esa búsqueda.
               </p>
               <p className="mt-1 text-xs text-slate-500">
-                Prueba con términos como &ldquo;pollo&rdquo;, &ldquo;salmón&rdquo;, &ldquo;lentejas&rdquo; o &ldquo;verduras&rdquo;.
+                Prueba con términos como &ldquo;pollo&rdquo;, &ldquo;salmón&rdquo;, &ldquo;lentejas&rdquo; o pega arriba un enlace directo.
               </p>
             </div>
           ) : (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               {results.map((rec) => {
-                const isAdded =
-                  addedIds.has(rec.id) || existingNames.has(rec.name.trim().toLowerCase());
+                const dupMatch = findDuplicateOrSimilarRecipe(rec, existingRecipes);
+                const isAdded = addedIds.has(rec.id) || Boolean(dupMatch);
                 const dietMeta = DIET_GROUPS.find((g) => g.id === rec.dietGroup);
 
                 return (
@@ -454,6 +696,12 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
                         </div>
                       </div>
 
+                      {dupMatch && !addedIds.has(rec.id) && (
+                        <p className="mt-2 rounded-lg bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-800">
+                          Ya tienes una similar: &laquo;{dupMatch.matchedRecipe.name}&raquo;
+                        </p>
+                      )}
+
                       <div className="mt-2.5 flex flex-wrap gap-1">
                         {rec.ingredients.slice(0, 4).map((ing) => (
                           <span
@@ -484,7 +732,7 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
                       {isAdded ? (
                         <>
                           <Check className="h-4 w-4" />
-                          Añadida a tu recetario (2 pers.)
+                          {addedIds.has(rec.id) ? 'Añadida a tu recetario (2 pers.)' : 'Ya en tu recetario'}
                         </>
                       ) : (
                         <>
@@ -504,7 +752,7 @@ function InternetSearchModal({ isOpen, onClose, existingRecipes, onAddRecipe }) 
   );
 }
 
-function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
+function PdfImportModal({ isOpen, onClose, existingRecipes = [], onSaveRecipesBatch }) {
   const [parsing, setParsing] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [errorMsgs, setErrorMsgs] = useState([]);
@@ -531,21 +779,36 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
   if (!isOpen) return null;
 
   const appendParsedResults = (parsedEntries = []) => {
-    const formatted = parsedEntries.map((entry) => ({
-      draftId: generateId('pdf_draft'),
-      selected: true,
-      sourceFile: entry.sourceFile || 'Receta PDF',
-      originalServings: entry.originalServings,
-      ...entry.recipe,
-      stepsText: (entry.recipe.steps || []).join('\n'),
-    }));
-
     setDraftItems((prev) => {
-      const merged = [...prev, ...formatted];
+      const seenSoFar = [...existingRecipes, ...prev];
+      const formatted = parsedEntries.map((entry) => {
+        const dupPrev = findDuplicateOrSimilarRecipe(entry.recipe, seenSoFar);
+        const isDuplicate = Boolean(entry.isDuplicate || dupPrev);
+        const duplicateOf = entry.duplicateOf || dupPrev?.matchedRecipe?.name || '';
+        const duplicateSource =
+          entry.duplicateSource || (dupPrev ? 'repetida / ya en cola' : '');
+        const duplicateReason = entry.duplicateReason || dupPrev?.reason || '';
+
+        seenSoFar.push(entry.recipe);
+
+        return {
+          draftId: generateId('pdf_draft'),
+          selected: !isDuplicate,
+          isDuplicate,
+          duplicateOf,
+          duplicateSource,
+          duplicateReason,
+          sourceFile: entry.sourceFile || 'Receta PDF',
+          originalServings: entry.originalServings,
+          ...entry.recipe,
+          stepsText: (entry.recipe.steps || []).join('\n'),
+        };
+      });
+
       if (formatted.length === 1 && prev.length === 0) {
         setExpandedDraftId(formatted[0].draftId);
       }
-      return merged;
+      return [...prev, ...formatted];
     });
   };
 
@@ -562,7 +825,7 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
     setLoadedFiles((prev) => Array.from(new Set([...prev, ...files.map((f) => f.name)])));
     setParsing(true);
     try {
-      const { items, errors } = await extractRecipesFromPdfFiles(files);
+      const { items, errors } = await extractRecipesFromPdfFiles(files, existingRecipes);
       if (items.length > 0) {
         appendParsedResults(items);
       }
@@ -627,9 +890,14 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
   };
 
   const selectedCount = draftItems.filter((d) => d.selected && d.name.trim()).length;
+  const duplicateCount = draftItems.filter((d) => d.isDuplicate).length;
 
   const handleToggleAll = (nextSelected) => {
     setDraftItems((prev) => prev.map((item) => ({ ...item, selected: nextSelected })));
+  };
+
+  const handleSelectOnlyNew = () => {
+    setDraftItems((prev) => prev.map((item) => ({ ...item, selected: !item.isDuplicate })));
   };
 
   const handleSaveBatch = (e) => {
@@ -784,15 +1052,33 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
           {draftItems.length > 0 && (
             <form id="pdf-batch-form" onSubmit={handleSaveBatch} className="space-y-3 border-t border-slate-200 pt-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="text-sm font-extrabold text-slate-900">
                     Recetas detectadas ({draftItems.length})
                   </span>
                   <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-bold text-emerald-700 ring-1 ring-emerald-200">
                     {selectedCount} seleccionadas
                   </span>
+                  {duplicateCount > 0 && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-bold text-amber-800 ring-1 ring-amber-200">
+                      <AlertTriangle className="h-3 w-3" />
+                      {duplicateCount} {duplicateCount === 1 ? 'repetida desmarcada' : 'repetidas desmarcadas'}
+                    </span>
+                  )}
                 </div>
-                <div className="flex items-center gap-2 text-xs font-semibold">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
+                  {duplicateCount > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handleSelectOnlyNew}
+                        className="text-violet-700 hover:underline"
+                      >
+                        Solo nuevas
+                      </button>
+                      <span className="text-slate-300">|</span>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={() => handleToggleAll(true)}
@@ -830,9 +1116,11 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
                     <div
                       key={draft.draftId}
                       className={`rounded-xl border transition ${
-                        draft.selected
-                          ? 'border-emerald-200 bg-white shadow-soft'
-                          : 'border-slate-200 bg-slate-50/70 opacity-75'
+                        draft.isDuplicate
+                          ? 'border-amber-200 bg-amber-50/40'
+                          : draft.selected
+                            ? 'border-emerald-200 bg-white shadow-soft'
+                            : 'border-slate-200 bg-slate-50/70 opacity-75'
                       }`}
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2 p-3.5">
@@ -849,6 +1137,14 @@ function PdfImportModal({ isOpen, onClose, onSaveRecipesBatch }) {
                             <p className="truncate text-sm font-bold text-slate-900">
                               {draft.name}
                             </p>
+                            {draft.isDuplicate && (
+                              <p className="mt-1 flex items-center gap-1 text-[11px] font-semibold text-amber-800">
+                                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+                                <span>
+                                  Repetida / muy similar a &laquo;{draft.duplicateOf}&raquo; ({draft.duplicateSource}) — desmarcada automáticamente
+                                </span>
+                              </p>
+                            )}
                             <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
                               <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-600">
                                 {draft.sourceFile}
@@ -1022,6 +1318,15 @@ export default function RecipesView({
   const [pdfModalOpen, setPdfModalOpen] = useState(false);
   const [editingRecipe, setEditingRecipe] = useState(null);
   const [expandedRecipeId, setExpandedRecipeId] = useState(null);
+  const [dupReviewOpen, setDupReviewOpen] = useState(false);
+
+  const duplicateGroups = useMemo(() => findDuplicateGroupsInRecipes(recipes), [recipes]);
+
+  const handleRemoveAllDuplicates = () => {
+    const idsToDelete = Array.from(new Set(duplicateGroups.map((p) => p.duplicate.id)));
+    idsToDelete.forEach((id) => onDeleteRecipe(id));
+    setDupReviewOpen(false);
+  };
 
   const [assigningRecipe, setAssigningRecipe] = useState(null);
   const [assignDay, setAssignDay] = useState('lunes');
@@ -1089,6 +1394,17 @@ export default function RecipesView({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {duplicateGroups.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setDupReviewOpen(true)}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2.5 text-xs font-bold text-amber-900 transition hover:bg-amber-100 sm:text-sm"
+            >
+              <AlertTriangle className="h-4 w-4 text-amber-600" />
+              Duplicadas ({duplicateGroups.length})
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setInternetModalOpen(true)}
@@ -1384,6 +1700,7 @@ export default function RecipesView({
           isOpen={modalOpen}
           onClose={() => setModalOpen(false)}
           recipeToEdit={editingRecipe}
+          existingRecipes={recipes}
           onSave={handleSaveModal}
         />
       )}
@@ -1398,8 +1715,89 @@ export default function RecipesView({
       <PdfImportModal
         isOpen={pdfModalOpen}
         onClose={() => setPdfModalOpen(false)}
+        existingRecipes={recipes}
         onSaveRecipesBatch={onAddRecipesBatch || ((list) => list.forEach(onAddRecipe))}
       />
+
+      {dupReviewOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 p-0 backdrop-blur-sm sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="dup-review-title"
+        >
+          <div className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="h-5 w-5 text-amber-600" />
+                <h2 id="dup-review-title" className="text-lg font-bold text-slate-900">
+                  Recetas repetidas o prácticamente iguales ({duplicateGroups.length})
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDupReviewOpen(false)}
+                aria-label="Cerrar"
+                className="rounded-xl p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-2.5 overflow-y-auto px-5 py-4">
+              {duplicateGroups.length === 0 ? (
+                <p className="py-6 text-center text-sm text-slate-500">
+                  No quedan recetas duplicadas en tu recetario.
+                </p>
+              ) : (
+                duplicateGroups.map(({ keep, duplicate, reason }) => (
+                  <div
+                    key={`${keep.id}_${duplicate.id}`}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50/50 p-3.5"
+                  >
+                    <div className="min-w-0 flex-1 text-xs">
+                      <p className="font-bold text-slate-900">
+                        Repetida: &laquo;{duplicate.name}&raquo;
+                      </p>
+                      <p className="mt-0.5 text-slate-600">
+                        Muy similar a: <strong>&laquo;{keep.name}&raquo;</strong> · {reason}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onDeleteRecipe(duplicate.id)}
+                      className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-bold text-rose-700 hover:bg-rose-50"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Eliminar copia
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-slate-200 bg-slate-50 px-5 py-3.5">
+              <button
+                type="button"
+                onClick={() => setDupReviewOpen(false)}
+                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 sm:text-sm"
+              >
+                Cerrar
+              </button>
+              {duplicateGroups.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleRemoveAllDuplicates}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white hover:bg-amber-700 sm:text-sm"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Eliminar todas las repetidas
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {assigningRecipe && (
         <div
