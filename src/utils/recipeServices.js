@@ -449,15 +449,25 @@ function parseIsoDurationToMinutes(iso = '') {
   const str = String(iso || '').trim();
   if (!str) return null;
   if (/^\d+$/.test(str)) return Number(str);
-  const m = str.match(/P(?:\d+D)?T(?:(\d+)H)?(?:(\d+)M)?/i);
-  if (!m) {
-    const minsMatch = str.match(/(\d+)\s*(?:min|m\b)/i);
-    return minsMatch ? Number(minsMatch[1]) : null;
+
+  // Formato ISO-8601 (ej. "PT1H15M", "PT45M")
+  const isoMatch = str.match(/P(?:\d+D)?T(?:(\d+)H)?(?:(\d+)M)?/i);
+  if (isoMatch && (isoMatch[1] || isoMatch[2])) {
+    const hours = Number(isoMatch[1] || 0);
+    const mins = Number(isoMatch[2] || 0);
+    const total = hours * 60 + mins;
+    if (total > 0) return total;
   }
-  const hours = Number(m[1] || 0);
-  const mins = Number(m[2] || 0);
-  const total = hours * 60 + mins;
-  return total > 0 ? total : null;
+
+  // Formato español / legible (ej. "1 h 15 m", "1 hora y 15 minutos", "75 min")
+  const hmMatch = str.match(/(\d+)\s*(?:horas?|hrs?|h\b)(?:\s*(?:y|,)?\s*(\d+)\s*(?:minutos?|mins?|m\b))?/i);
+  if (hmMatch) {
+    const total = Number(hmMatch[1] || 0) * 60 + Number(hmMatch[2] || 0);
+    if (total > 0) return total;
+  }
+
+  const minsMatch = str.match(/(\d+)\s*(?:minutos?|min|m\b)/i);
+  return minsMatch ? Number(minsMatch[1]) : null;
 }
 
 function parseServingsCount(rawYield) {
@@ -588,6 +598,64 @@ function parseWebIngredientString(raw = '') {
   return parseIngredientLine(normalized);
 }
 
+function extractStepsFromHtmlDoc(doc) {
+  if (!doc) return [];
+  const stepSelectors = [
+    '[itemprop="recipeInstructions"] li',
+    '[itemprop="recipeInstructions"] p',
+    '.asset-recipe-steps p',
+    '.asset-recipe-steps li',
+    '.instructions li',
+    '.recipe-steps li',
+    '[class*="preparacion"] li',
+    '[class*="preparacion"] p',
+    '[class*="elaboracion"] li',
+    '[class*="pasos"] li',
+    '[class*="instruction"] p',
+  ];
+  for (const sel of stepSelectors) {
+    const found = Array.from(doc.querySelectorAll(sel))
+      .map((n) => decodeHtmlEntities((n.textContent || '').replace(/^\d+[.)]\s*/, '')))
+      .filter((s) => s.length > 15 && !/^(?:dificultad|tiempo total|elaboraci[oó]n|cocci[oó]n)\b/i.test(s));
+    if (found.length >= 1) return found;
+  }
+
+  // Buscar encabezados ("Cómo hacer ...", "Preparación", "Elaboración") y extraer párrafos hermanos
+  const headings = Array.from(doc.querySelectorAll('h2, h3'));
+  for (const h of headings) {
+    const hText = (h.textContent || '').trim();
+    if (/^(?:c[oó]mo\s+hacer\b|preparaci[oó]n\b|elaboraci[oó]n\b|pasos\b)/i.test(hText)) {
+      const collected = [];
+      let el = h.nextElementSibling;
+      let guard = 0;
+      while (el && guard < 25) {
+        guard += 1;
+        const tag = el.tagName?.toUpperCase();
+        if (tag === 'H2' || tag === 'H3') break;
+        if (tag === 'P' || tag === 'OL' || tag === 'UL') {
+          if (tag === 'P') {
+            const txt = decodeHtmlEntities((el.textContent || '').replace(/^\d+[.)]\s*/, ''));
+            if (txt.length > 18 && !/^(?:en directo al paladar|tiempo total|dificultad)\b/i.test(txt)) {
+              collected.push(txt);
+            }
+          } else {
+            const lis = Array.from(el.querySelectorAll('li'));
+            for (const li of lis) {
+              const txt = decodeHtmlEntities((li.textContent || '').replace(/^\d+[.)]\s*/, ''));
+              if (txt.length > 12 && !/^(?:tiempo total|elaboraci[oó]n|cocci[oó]n|reposo)\b/i.test(txt)) {
+                collected.push(txt);
+              }
+            }
+          }
+        }
+        el = el.nextElementSibling;
+      }
+      if (collected.length >= 1) return collected;
+    }
+  }
+  return [];
+}
+
 export function extractRecipeFieldsFromHtml(html = '', url = '') {
   let hostLabel = 'Web';
   try {
@@ -595,6 +663,18 @@ export function extractRecipeFieldsFromHtml(html = '', url = '') {
   } catch {
     // ignore
   }
+
+  let parsedDoc = null;
+  const getDoc = () => {
+    if (!parsedDoc && typeof DOMParser !== 'undefined') {
+      try {
+        parsedDoc = new DOMParser().parseFromString(html, 'text/html');
+      } catch {
+        parsedDoc = null;
+      }
+    }
+    return parsedDoc;
+  };
 
   // Estrategia 1: Schema.org JSON-LD (el estándar de casi todas las webs de recetas)
   const ldMatches = html.matchAll(
@@ -621,7 +701,10 @@ export function extractRecipeFieldsFromHtml(html = '', url = '') {
 
         const parsedIngs = rawIngList.map(parseWebIngredientString).filter(Boolean);
         const scaledIngredients = scaleIngredients(parsedIngs, sourceServings, DEFAULT_SERVINGS);
-        const steps = flattenJsonLdInstructions(recipeNode.recipeInstructions);
+        let steps = flattenJsonLdInstructions(recipeNode.recipeInstructions);
+        if (steps.length === 0) {
+          steps = extractStepsFromHtmlDoc(getDoc());
+        }
         const cleanTitle = decodeHtmlEntities(recipeNode.name);
         const descText = decodeHtmlEntities(recipeNode.description || '').slice(0, 180);
         const catHint = [
@@ -663,10 +746,10 @@ export function extractRecipeFieldsFromHtml(html = '', url = '') {
     }
   }
 
-  // Estrategia 2: DOMParser / selectores HTML semánticos
-  if (typeof DOMParser !== 'undefined') {
+  // Estrategia 2: DOMParser / selectores HTML semánticos (incluye Directo al Paladar / Webedia)
+  const doc = getDoc();
+  if (doc) {
     try {
-      const doc = new DOMParser().parseFromString(html, 'text/html');
       const h1Title = doc.querySelector('h1')?.textContent?.trim();
       const ogTitle = doc.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
       const docTitle = doc.querySelector('title')?.textContent?.split('|')[0]?.split(' - ')[0]?.trim();
@@ -680,6 +763,9 @@ export function extractRecipeFieldsFromHtml(html = '', url = '') {
       const ingSelectors = [
         '[itemprop="recipeIngredient"]',
         '[itemprop="ingredients"]',
+        '.asset-recipe-ingr',
+        '.asset-recipe-list li',
+        '.ingredient-list li',
         '.ingredient',
         '.ingredients li',
         '[class*="ingred"] li',
@@ -694,38 +780,23 @@ export function extractRecipeFieldsFromHtml(html = '', url = '') {
         }
       }
 
-      const stepSelectors = [
-        '[itemprop="recipeInstructions"] li',
-        '[itemprop="recipeInstructions"] p',
-        '.instructions li',
-        '.recipe-steps li',
-        '[class*="preparacion"] li',
-        '[class*="elaboracion"] li',
-        '[class*="pasos"] li',
-        '[class*="instruction"] p',
-      ];
-      let stepNodes = [];
-      for (const sel of stepSelectors) {
-        const found = Array.from(doc.querySelectorAll(sel));
-        if (found.length >= 1) {
-          stepNodes = found;
-          break;
-        }
-      }
-
       const parsedIngs = ingNodes
         .map((n) => parseWebIngredientString(n.textContent || ''))
         .filter(Boolean);
-      const steps = stepNodes
-        .map((n) => decodeHtmlEntities((n.textContent || '').replace(/^\d+[.)]\s*/, '')))
-        .filter((s) => s.length > 6);
+      const steps = extractStepsFromHtmlDoc(doc);
 
       if (title && (parsedIngs.length >= 2 || steps.length >= 1)) {
+        const yieldNodeText = doc.querySelector('.asset-recipe-yield, [itemprop="recipeYield"]')?.textContent || '';
+        const timeNodeText = doc.querySelector('.asset-recipe-time, [itemprop="totalTime"]')?.textContent || '';
         const bodyText = doc.body?.textContent || '';
-        const servingsMatch = bodyText.match(/(\d+)\s*(?:personas?|raciones?|comensales?|porciones?)/i);
+        const servingsMatch =
+          yieldNodeText.match(/(\d+)/) ||
+          bodyText.match(/(?:para\s+)?(\d+)\s*(?:personas?|raciones?|comensales?|porciones?)/i);
         const sourceServings = servingsMatch ? parseServingsCount(servingsMatch[1]) : DEFAULT_SERVINGS;
-        const timeMatch = bodyText.match(/(\d+)\s*(?:min|minutos)\b/i);
-        const prepTime = timeMatch ? Math.max(5, Math.min(240, Number(timeMatch[1]))) : 25;
+        const prepTime =
+          parseIsoDurationToMinutes(timeNodeText) ||
+          parseIsoDurationToMinutes(bodyText.match(/tiempo\s+total\s*[:\-]?\s*([^\n]{1,25})/i)?.[1] || '') ||
+          25;
 
         const scaledIngredients = scaleIngredients(parsedIngs, sourceServings, DEFAULT_SERVINGS);
         const candidate = {
@@ -777,6 +848,9 @@ export function extractRecipeFromMarkdownOrText(rawText = '', url = '') {
   let section = 'none';
 
   for (const line of lines) {
+    if (/^[-=_*]{3,}$/.test(line) || /^!\[/.test(line)) {
+      continue;
+    }
     if (!title && /^#\s+(.+)$/.test(line)) {
       title = line.replace(/^#\s+/, '').trim();
       continue;
@@ -786,35 +860,80 @@ export function extractRecipeFromMarkdownOrText(rawText = '', url = '') {
       continue;
     }
 
-    const servM = line.match(/(\d+)\s*(?:personas?|raciones?|comensales?|porciones?|servings?)/i);
-    if (servM && section === 'none') {
+    const servM = line.match(/(?:para\s+)?(\d+)\s*(?:personas?|raciones?|comensales?|porciones?|servings?)/i);
+    if (servM && (section === 'none' || section === 'ingredients')) {
       sourceServings = parseServingsCount(servM[1]);
-    }
-    const timeM = line.match(/(\d+)\s*(?:min|minutos)\b/i);
-    if (timeM && section === 'none' && prepTime === 25) {
-      prepTime = Math.max(5, Math.min(240, Number(timeM[1])));
+      if (/^para\s+\d+\s+personas?/i.test(line.replace(/^[-*•\s]+/, ''))) {
+        continue;
+      }
     }
 
-    const cleanHeading = line.replace(/^#+\s*/, '').replace(/[:*\s]+$/, '').toLowerCase();
-    if (/^(ingredientes|ingredients)$/.test(cleanHeading)) {
+    const cleanBulletText = line.replace(/^[-*•\s]+/, '').trim();
+    if (/^tiempo\s+(?:total|de\s+preparaci[oó]n)?\b/i.test(cleanBulletText)) {
+      const parsedTime = parseIsoDurationToMinutes(cleanBulletText);
+      if (parsedTime) prepTime = parsedTime;
+      continue;
+    }
+
+    const cleanHeading = line
+      .replace(/^#+\s*/, '')
+      .replace(/\*+/g, '')
+      .replace(/[:\s]+$/, '')
+      .toLowerCase();
+
+    if (/^(?:ingredientes|ingredients)\b/.test(cleanHeading) && cleanHeading.length <= 40) {
       section = 'ingredients';
       continue;
     }
-    if (/^(preparaci[oó]n|elaboraci[oó]n|c[oó]mo hacer|instrucciones|pasos|instructions|method|steps)$/.test(cleanHeading)) {
+    if (
+      /^(?:c[oó]mo\s+hacer\b|preparaci[oó]n\b|elaboraci[oó]n\b|paso\s+a\s+paso\b|instrucciones\b|pasos\b|instructions\b|method\b|steps\b)/.test(
+        cleanHeading,
+      ) &&
+      cleanHeading.length <= 90
+    ) {
       section = 'steps';
       continue;
     }
-    if (/^#{1,3}\s+/.test(line) && section !== 'none') {
+    if (
+      (/^#{1,3}\s+/.test(line) || /^(?:con\s+qu[eé]\s+acompa[ñn]ar|en\s+directo\s+al\s+paladar)\b/i.test(cleanHeading)) &&
+      section !== 'none'
+    ) {
       section = 'none';
       continue;
     }
 
-    if (section === 'ingredients' && /^[-*•\d]/.test(line)) {
-      const cleaned = line.replace(/^[-*•]\s*/, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim();
-      if (cleaned.length >= 2 && cleaned.length <= 120) rawIngLines.push(cleaned);
-    } else if (section === 'steps' && (line.length > 10 || /^\d+[.)]/.test(line))) {
-      const cleaned = line.replace(/^\d+[.)]\s*/, '').replace(/^[-*•]\s*/, '').trim();
-      if (cleaned.length > 8 && !/^https?:\/\//.test(cleaned)) rawStepLines.push(cleaned);
+    if (section === 'ingredients') {
+      if (/^(?:\[?!\[|http|en directo al paladar|dificultad|compartir)/i.test(cleanBulletText)) {
+        continue;
+      }
+      if (/^[-*+•\d]/.test(line) || (line.length >= 3 && line.length <= 100 && !/[.;]{1}.*\s+/.test(line))) {
+        const cleaned = line
+          .replace(/^[-*+•]\s*/, '')
+          .replace(/\*+/g, '')
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+          .trim();
+        if (cleaned.length >= 2 && cleaned.length <= 120) {
+          rawIngLines.push(cleaned);
+        }
+      }
+    } else if (section === 'steps') {
+      if (
+        /^(?:dificultad|tiempo\s+total|elaboraci[oó]n|cocci[oó]n|reposo|ver\s+m[aá]s)\b/i.test(cleanBulletText) ||
+        /^!\[/.test(line)
+      ) {
+        continue;
+      }
+      if (line.length > 14 || /^\d+[.)]/.test(line)) {
+        const cleaned = line
+          .replace(/^\d+[.)]\s*/, '')
+          .replace(/^[-*+•]\s*/, '')
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+          .replace(/\*+/g, '')
+          .trim();
+        if (cleaned.length > 10 && !/^https?:\/\//.test(cleaned)) {
+          rawStepLines.push(cleaned);
+        }
+      }
     }
   }
 
@@ -827,7 +946,11 @@ export function extractRecipeFromMarkdownOrText(rawText = '', url = '') {
     mealCategory: detectMealCategoryFromText(title),
     prepTime,
     servings: DEFAULT_SERVINGS,
-    description: `Receta extraída de ${hostLabel} · Ajustada a 2 personas.`,
+    description: `Receta extraída de ${hostLabel}${
+      sourceServings !== DEFAULT_SERVINGS
+        ? ` · Reescalada de ${sourceServings} a ${DEFAULT_SERVINGS} personas`
+        : ' · Ajustada a 2 personas'
+    }.`,
     sourceLabel: hostLabel,
     sourceUrl: url,
     imageUrl: '',
@@ -1238,8 +1361,37 @@ function expandCompoundIngredientLine(rawLine) {
   return finalParts;
 }
 
+function normalizeSpanishUnit(rawUnit = '') {
+  const u = (rawUnit || '').toLowerCase().trim();
+  if (/^(g|gr|gramos)$/.test(u)) return { unit: 'g', keepFixed: false };
+  if (u === 'kg') return { unit: 'kg', keepFixed: false };
+  if (u === 'ml') return { unit: 'ml', keepFixed: false };
+  if (/^(l|litros?)$/.test(u)) return { unit: 'l', keepFixed: false };
+  if (/^(cda|cdas|cucharadas?)$/.test(u)) return { unit: 'cda', keepFixed: false };
+  if (/^(cdta|cdtas|cucharaditas?)$/.test(u)) return { unit: 'cdta', keepFixed: false };
+  if (/^tazas?$/.test(u)) return { unit: 'taza', keepFixed: false };
+  if (/^rebanadas?$/.test(u)) return { unit: 'rebanada', keepFixed: false };
+  if (/^dientes?$/.test(u)) return { unit: 'diente', keepFixed: false };
+  if (/^manojos?$/.test(u)) return { unit: 'manojo', keepFixed: false };
+  if (/^pizcas?$/.test(u)) return { unit: 'pizca', keepFixed: true };
+  return { unit: 'ud', keepFixed: false };
+}
+
+function parseNumericToken(rawNumText = '') {
+  const rawNum = String(rawNumText).replace(/\s+/g, '').replace(',', '.');
+  if (rawNum.includes('/')) {
+    const [a, b] = rawNum.split('/').map(Number);
+    return b ? a / b : 1;
+  }
+  const n = Number(rawNum);
+  return Number.isFinite(n) ? n : 1;
+}
+
+const UNIT_PATTERN =
+  'kg|g|gr|gramos|ml|l|litros?|ud|uds|unidades?|cda|cdas|cucharadas?|cdta|cdtas|cucharaditas?|taza|tazas|rebanada|rebanadas|diente|dientes|manojo|manojos|ramita|ramitas|rama|ramas|hebra|hebras|pizca|pizcas';
+
 function parseIngredientLine(line) {
-  let clean = String(line || '')
+  const clean = String(line || '')
     .replace(/^[-•*▪▫►]\s*/, '')
     .replace(/^\d+[.)]\s*/, '')
     .trim();
@@ -1249,43 +1401,44 @@ function parseIngredientLine(line) {
   const withoutTrailingNotes = clean.replace(/\s*\([^)]*\)\s*$/g, '').trim();
   const baseLine = withoutTrailingNotes || clean;
 
-  // Formato: "300 g de garbanzos cocidos" o "2 zanahorias" o "200ml leche"
-  const match = baseLine.match(
-    /^(\d+(?:[.,]\d+)?(?:\s*\/\s*\d+)?)\s*(kg|g|gr|gramos|ml|l|litros|ud|uds|unidades?|cda|cdas|cucharadas?|cdta|cdtas|cucharaditas?|taza|tazas|rebanada|rebanadas|diente|dientes|manojo|manojos|pizca|pizcas)?\s*(?:de\s+)?(.+)$/i,
+  // 1) Cantidad al principio: "300 g de garbanzos cocidos", "2 zanahorias", "200ml leche"
+  const prefixMatch = baseLine.match(
+    new RegExp(
+      `^(\\d+(?:[.,]\\d+)?(?:\\s*\\/\\s*\\d+)?)\\s*(${UNIT_PATTERN})?\\s*(?:de\\s+)?(.+)$`,
+      'i',
+    ),
   );
+
+  // 2) Cantidad al final (estilo Directo al Paladar): "Alubias blancas cocidas 200 g", "Zanahorias 2", "Pan de hogaza 1 rebanada"
+  const suffixMatch = !prefixMatch
+    ? baseLine.match(
+        new RegExp(
+          `^(.+?)(?:\\s*[:—–-]\\s*|\\s+)(\\d+(?:[.,]\\d+)?(?:\\s*\\/\\s*\\d+)?)(?![%°º\\d])\\s*(${UNIT_PATTERN})?$`,
+          'i',
+        ),
+      )
+    : null;
 
   let amount = 1;
   let unit = 'pizca';
   let name = baseLine;
   let keepFixed = true;
 
-  if (match) {
-    keepFixed = false;
-    const rawNum = match[1].replace(/\s+/g, '').replace(',', '.');
-    if (rawNum.includes('/')) {
-      const [a, b] = rawNum.split('/').map(Number);
-      amount = b ? a / b : 1;
-    } else {
-      amount = Number(rawNum) || 1;
+  if (prefixMatch) {
+    amount = parseNumericToken(prefixMatch[1]);
+    const normUnit = normalizeSpanishUnit(prefixMatch[2]);
+    unit = normUnit.unit;
+    keepFixed = normUnit.keepFixed;
+    name = prefixMatch[3].trim();
+  } else if (suffixMatch) {
+    const candidateAmount = parseNumericToken(suffixMatch[2]);
+    if (candidateAmount > 0) {
+      amount = candidateAmount;
+      const normUnit = normalizeSpanishUnit(suffixMatch[3]);
+      unit = normUnit.unit;
+      keepFixed = normUnit.keepFixed;
+      name = suffixMatch[1].trim();
     }
-
-    const rawUnit = (match[2] || '').toLowerCase();
-    if (/^(g|gr|gramos)$/.test(rawUnit)) unit = 'g';
-    else if (rawUnit === 'kg') unit = 'kg';
-    else if (rawUnit === 'ml') unit = 'ml';
-    else if (/^(l|litros?)$/.test(rawUnit)) unit = 'l';
-    else if (/^(cda|cdas|cucharadas?)$/.test(rawUnit)) unit = 'cda';
-    else if (/^(cdta|cdtas|cucharaditas?)$/.test(rawUnit)) unit = 'cdta';
-    else if (/^tazas?$/.test(rawUnit)) unit = 'taza';
-    else if (/^rebanadas?$/.test(rawUnit)) unit = 'rebanada';
-    else if (/^dientes?$/.test(rawUnit)) unit = 'diente';
-    else if (/^manojos?$/.test(rawUnit)) unit = 'manojo';
-    else if (/^pizcas?$/.test(rawUnit)) {
-      unit = 'pizca';
-      keepFixed = true;
-    } else unit = 'ud';
-
-    name = match[3].trim();
   }
 
   name = name.replace(/\s*\([^)]*\)\s*$/g, '').replace(/^[.,:\s]+|[.,:\s]+$/g, '');
